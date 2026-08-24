@@ -1146,7 +1146,10 @@ class AdvancedRecorderApp:
             self.show_alert(f"CONFIGURATION ERROR  •  {exc}", "error", 5000)
             return
 
-        out_template = os.path.join(out_dir, "rec_%Y-%m-%d_%H-%M-%S.mkv")
+        out_template = os.path.join(
+    out_dir,
+    "trackingWheel_%Y_%b_%d_%H_%M_%S.mkv"
+)
 
         cmd = [
             "ffmpeg",
