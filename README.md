@@ -1,6 +1,133 @@
-# Cyber Video Data Logger
+# Cyber Video Data Logger — 4K + Thermal
 
 A Linux desktop application for long-duration camera recording and monitoring. The program provides a modern CustomTkinter GUI for selecting a V4L2 camera, configuring resolution/FPS/codec/quality, recording segmented video files with FFmpeg, previewing the camera, estimating storage requirements, monitoring remaining recording capacity, and optionally displaying CPU/RAM telemetry.
+
+It now also drives a **TOPDON TC001 / TS001 thermal camera** next to the normal camera, and has two tabs:
+
+- **VIDEO** — the original recorder. With the thermal camera enabled, a thermal video is recorded *simultaneously*, segmented with the same chunk length.
+- **PHOTO** — a dual-camera time-lapse from **1 to 1440 frames per day** (1/min), either at a constant step from a start time, or at times you type in yourself.
+
+Press **H** anywhere in the app for the keyboard-shortcut popup.
+
+---
+
+## What's new: thermal camera + PHOTO tab
+
+### Devices & Output card
+Two switches, **CAMERA** and **THERMAL**, turn each device on or off for both tabs (you can record thermal-only or camera-only). The scan recognises the thermal camera by its 256×384 stream and picks it automatically; `Auto-detect` lets the thermalcam library scan for it instead.
+
+### Thermal camera card (shared by both tabs)
+The same modes and settings as the thermalcam viewer:
+
+| Setting | What it does |
+|---|---|
+| Palette | inferno, gray, jet, hot, magma, plasma, viridis, bone, rainbow, turbo |
+| Span mode | **Auto** (per-frame min/max), **Manual** (fixed °C window — a temperature is always the same colour), **Percentile** (per-frame, ignores hot/cold specks) |
+| Span °C / Percentile % | the two bounds, applied with SET or Enter |
+| Correction | **Off**, **Offset / gain** (`corrected = measured × gain + offset`), **Reference points** |
+| Reference points | click the thermal preview to drop a point, **K** (or double-click) to type its true temperature. 1 point fits an offset, 2+ fit gain and offset; **F** cycles auto/offset/linear/quadratic/off. A point on a steep gradient turns amber with `!`. |
+| LOAD / SAVE | thermal settings + calibration, kept in `~/.config/amin_studio/` |
+
+All settings (both tabs) are also saved automatically when the window is closed.
+
+### VIDEO tab — simultaneous thermal recording
+
+| Option | Choices |
+|---|---|
+| Thermal fps | 25 (sensor native), 15, 10, 5, 2, 1 |
+| Thermal output | **Colour video (H.264)** — false colour with scale bar; **Radiometric (FFV1 16-bit)** — lossless temperature video; or both |
+| Burn in | scale bar, timestamp and min/max/mean on every frame of the colour video |
+
+Chunks are cut **on the clock** (for 30-min chunks: at every :00 and :30), for the camera and the thermal camera alike, so both chunks of the same period start together. Names use numeric dates (set the prefix in *File prefix*), so sorting by name sorts by time:
+
+```text
+trackingWheel_2026-09-28_12-30-00_camera.mkv          camera
+trackingWheel_2026-09-28_12-30-00_thermal.mkv         thermal, false colour
+trackingWheel_2026-09-28_12-30-00_thermal_raw.mkv     thermal, radiometric (uncorrected)
+trackingWheel_2026-09-28_12-30-00_thermal_frames.csv  wall-clock time of every thermal frame
+trackingWheel_2026-09-28_12-17-43_thermal_info.json   once per recording: format description
+trackingWheel_2026-09-28_12-17-43_thermal_settings.csv once per recording: correction/span at start + every change
+```
+
+The first chunk of a recording starts when you press start; every later one starts on a clock boundary. The camera chunk may be named a second or two later than the thermal one (the camera can only cut on a keyframe).
+
+The radiometric video is 256×192 `gray16le` holding the **uncorrected** sensor temperature: `sensor_°C = value / 64 − 273.15` (0 = no signal). The correction is kept separately in `_thermal_settings.csv` as polynomial coefficients, highest order first, so `corrected_°C = numpy.polyval(coeffs, sensor_°C)`. A calibration can therefore always be redone after the fact. Read a chunk with:
+
+```bash
+ffmpeg -i X_thermal_raw.mkv -f rawvideo -pix_fmt gray16le - | python3 -c "
+import sys, numpy as np
+a = np.frombuffer(sys.stdin.buffer.read(), '<u2').reshape(-1, 192, 256) / 64 - 273.15
+print(a.shape, a.min(), a.max())"
+```
+
+Frame *n* of the raw video, frame *n* of the colour video and row *n* of `_thermal_frames.csv` are the same moment.
+
+If the thermal camera drops out mid-recording, frames marked *THERMAL SIGNAL LOST* (zeros in the raw file) are written so the timeline stays correct, and the camera is reconnected automatically.
+
+### PHOTO tab — dual-camera time-lapse
+
+- **Frames / day**: 1 … 1440 (default 2). Pick a preset or type any number.
+- **Constant step**: set the *first shot* time; shots are spaced evenly over 24 h (e.g. 2/day from 08:00 → 08:00 and 20:00).
+- **Manual times**: type one time per line (`HH:MM` or `HH:MM:SS`), or press *FILL FROM FRAMES / DAY* and edit the result.
+- The schedule repeats every day until you stop it. The header shows the countdown to the next shot.
+- Camera: resolution, JPG (quality) or PNG. Thermal: colour PNG (optionally with scale bar + time), and the temperature data as **NPY** (°C float32), **CSV** (°C), or **PNG16** (K×64, lossless), averaged over N frames to reduce noise.
+- Temperature data files hold the **uncorrected** sensor °C. The correction used for each shot (coefficients, span) is in `capture_log.csv`. Tick *Also save a corrected copy* to get a `_correctedC` file as well.
+- **CAPTURE NOW** (or **C**) takes one test pair immediately.
+
+Both cameras are triggered together and every file of one shot carries the **same timestamp to the second**, so sorting the folder by name keeps each pair side by side:
+
+```text
+frame_2026-09-28_12-46-00_camera.jpg
+frame_2026-09-28_12-46-00_thermal.png
+frame_2026-09-28_12-46-00_thermal_sensorC.npy
+frame_2026-09-28_12-47-00_camera.jpg
+frame_2026-09-28_12-47-00_thermal.png
+...
+capture_log.csv    one row per shot: time with UTC offset, files, thermal min/max/mean/centre,
+                   correction + coefficients, span
+```
+
+### Camera exposure, white balance and focus
+
+*Exposure/WB* in the Devices card (needs `v4l2-ctl` from `v4l-utils`):
+
+- **Auto**: the camera decides everything (as before).
+- **Lock at start**: auto-exposure, auto white balance and autofocus settle, then their values are frozen for the whole recording or time-lapse, so brightness changes in the images come from the scene, not the camera. The locked values are shown in the card and in the log.
+- **Manual**: your own exposure / gain / WB (K) / focus values; blank = leave that one on auto. **READ** fills in what the camera is using now.
+
+With *Lock at start*, the controls go back to auto when the capture stops. *Manual* values stay set on the camera until you switch to Auto.
+
+### Unattended runs: log, sleep, crash and reboot
+
+- **Log**: everything that happens goes to `<save path>/logs/studio.log`, a new file every midnight: starts/stops, locked exposure values, every thermal-setting change, camera dropouts and reconnects, encoder restarts, skipped or failed shots, low-disk stops, and every warning shown on screen. FFmpeg's own messages go to `logs/ffmpeg_camera.log` and `logs/ffmpeg_thermal_*.log`. Before a capture starts, the log is in `~/.config/amin_studio/logs/`.
+- **No sleep**: while capturing, the app blocks suspend, idle-sleep and lid-close sleep (via `systemd-inhibit`). To be safe, also turn off *Automatic Suspend* in Ubuntu's power settings.
+- **Crash recovery**: if the camera FFmpeg dies, only it is restarted. The thermal recording continues uninterrupted.
+- **Resume**: with *Resume unfinished capture on launch* ticked (default), a capture that ended because the app crashed or the machine rebooted restarts automatically 20 s after the app opens (ESC cancels). If the camera isn't there yet (e.g. just after a reboot) it rescans and waits up to about a minute. The log records when the interrupted run started and when it resumed, so the gap is visible. A capture you stop yourself, or end by closing the window, is not resumed.
+- **Launch at login**: starts the app automatically when you log in. Combined with automatic login in Ubuntu's user settings, a time-lapse survives a power cut or reboot with no one at the machine.
+
+The thermal camera stays on during a time-lapse (it needs a few minutes of warm-up to be accurate). The normal camera stays open when shots are ≤ 15 min apart; for sparser schedules it is opened ~1.5 s before each shot so it doesn't run all day.
+
+### Keyboard shortcuts (press H)
+
+| Keys | Action |
+|---|---|
+| H | show / hide the shortcut popup |
+| V / I | VIDEO tab / PHOTO (imaging) tab |
+| SPACE | start recording or time-lapse; press twice within 2 s to stop |
+| L · C · G · R | live stream · capture now · CPU/RAM · refresh devices |
+| P / Shift+P · M · E | palette · span mode · type span min/max |
+| [ ] · - + · B · T | shift span · narrow/widen · span to ref points · freeze thermal |
+| click · K · 1–9 · X / Shift+X | add/select ref point · type its temperature · select · delete / clear |
+| F · U · S · O | fit mode · refit · save · load |
+
+Shortcuts are ignored while typing in a field; ESC leaves the field.
+
+### Thermal camera notes
+- Uninstall any TOPDON PC software on machines where it exists; its driver blocks raw capture.
+- Your user must be in the `video` group (see below).
+- Accuracy is the sensor's (±2 °C or ±2 %) after warm-up; use reference points for better.
+
+---
 
 This guide explains how to set up the project from a fresh **Ubuntu** machine by cloning it from GitHub and installing all required system and Python dependencies.
 
@@ -25,6 +152,8 @@ This guide explains how to set up the project from a fresh **Ubuntu** machine by
 - Automatic detection of FFmpeg recording-process failure
 - Low-disk-space protection
 - Dark cyber-style GUI
+- TOPDON TC001 / TS001 thermal camera: simultaneous thermal video, dual-camera time-lapse, span modes, palettes and reference-point calibration
+- Keyboard shortcuts with a help popup (H)
 
 ---
 
@@ -146,7 +275,9 @@ You should normally have at least these files:
 
 ```text
 YOUR_REPOSITORY/
-├── cyber_video_data_logger.py
+├── amin_studio.py            # the GUI
+├── studio_services.py        # camera owners, thermal pipeline, recorder, scheduler
+├── thermalcam/               # TOPDON TC001 / TS001 radiometric driver (from the thermalcam project)
 ├── requirements_cyber_video_logger.txt
 └── README.md
 ```
@@ -208,7 +339,7 @@ Every time you open a new terminal and want to run the application:
 ```bash
 cd ~/YOUR_REPOSITORY
 source .venv/bin/activate
-python3 cyber_video_data_logger.py
+python3 amin_studio.py
 ```
 
 To leave the virtual environment:
@@ -331,7 +462,7 @@ source .venv/bin/activate
 Run:
 
 ```bash
-python3 cyber_video_data_logger.py
+python3 amin_studio.py
 ```
 
 The graphical application should open.
@@ -686,7 +817,7 @@ python3 -m pip install -r requirements_cyber_video_logger.txt
 Then run:
 
 ```bash
-python3 cyber_video_data_logger.py
+python3 amin_studio.py
 ```
 
 ---
@@ -737,7 +868,7 @@ python3 -m pip install -r requirements_cyber_video_logger.txt
 v4l2-ctl --list-devices
 
 # Start the program
-python3 cyber_video_data_logger.py
+python3 amin_studio.py
 ```
 
 After the first installation, starting the program is much shorter:
@@ -745,7 +876,7 @@ After the first installation, starting the program is much shorter:
 ```bash
 cd ~/YOUR_REPOSITORY
 source .venv/bin/activate
-python3 cyber_video_data_logger.py
+python3 amin_studio.py
 ```
 
 ---
@@ -1008,7 +1139,7 @@ A clean repository can look like this:
 
 ```text
 cyber-video-data-logger/
-├── cyber_video_data_logger.py
+├── amin_studio.py
 ├── requirements_cyber_video_logger.txt
 ├── README.md
 ├── .gitignore
@@ -1036,7 +1167,7 @@ After the project has already been installed:
 ```bash
 cd ~/YOUR_REPOSITORY
 source .venv/bin/activate
-python3 cyber_video_data_logger.py
+python3 amin_studio.py
 ```
 
 Then select your camera/settings and start recording from the GUI.
