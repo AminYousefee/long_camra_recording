@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -582,10 +583,27 @@ class CameraService:
 
     def _open(self):
         device, w, h = self.config
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(device)
+        if sys.platform.startswith("win") or sys.platform == "darwin":
+            index = device_index(device)
+            if index is None:
+                raise RuntimeError(f"invalid Windows camera index: {device}")
+            backends = ([cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+                        if sys.platform.startswith("win")
+                        else [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY])
+            cap = None
+            for backend in backends:
+                candidate = cv2.VideoCapture(index, backend)
+                if candidate.isOpened():
+                    cap = candidate
+                    break
+                candidate.release()
+            if cap is None:
+                raise RuntimeError(f"could not open {device}")
+        else:
+            cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(device)
         if not cap.isOpened():
             raise RuntimeError(f"could not open {device}")
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -1281,6 +1299,8 @@ def _v4l2(args: list[str], timeout: float = 3.0) -> str:
 
 def list_controls(device: str) -> dict[str, dict]:
     """{semantic: {name, min, max, default, value}} for the controls present."""
+    if not sys.platform.startswith("linux"):
+        return {}
     raw: dict[str, dict] = {}
     for line in _v4l2(["-d", device, "--list-ctrls"]).splitlines():
         m = _CTRL_RE.match(line)

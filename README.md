@@ -1,6 +1,8 @@
 # Cyber Video Data Logger — 4K + Thermal
 
-A Linux desktop application for long-duration camera recording and monitoring. The program provides a modern CustomTkinter GUI for selecting a V4L2 camera, configuring resolution/FPS/codec/quality, recording segmented video files with FFmpeg, previewing the camera, estimating storage requirements, monitoring remaining recording capacity, and optionally displaying CPU/RAM telemetry.
+A cross-platform desktop application for long-duration camera recording and monitoring. The program provides a modern CustomTkinter GUI for selecting a camera, configuring resolution/FPS/codec/quality, recording segmented video files with FFmpeg, previewing the camera, estimating storage requirements, monitoring remaining recording capacity, and optionally displaying CPU/RAM telemetry.
+
+Camera capture also has native backend paths for Windows (DirectShow/Media Foundation) and macOS (AVFoundation), so standard USB webcams do not need to be from a specific brand. Install FFmpeg with the matching input backend enabled and allow the app to access the camera in the operating system's privacy settings. Manual exposure, white-balance, and focus controls are Linux/V4L2-only. The setup guide below remains Ubuntu-focused.
 
 It now also drives a **TOPDON TC001 / TS001 thermal camera** next to the normal camera, and has two tabs:
 

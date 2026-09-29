@@ -98,15 +98,13 @@ def _backend_name(backend: int) -> str:
 def _platform_backends() -> list[int]:
     """Backends to try, best-first, for the current OS.
 
-    MSMF leads on Windows. DSHOW is the more common recommendation, but on this
-    camera it hands back a converted 3-channel frame even while reporting
-    ``CONVERT_RGB == 0`` -- it claims to have honoured the request and has not.
-    MSMF instead returns the untouched UVC payload as one flat buffer, which is
-    exactly what we want. Order only affects how fast we get there, since every
+    Windows indices come from DirectShow enumeration, so try DSHOW first to
+    keep them stable. This thermal camera's DSHOW path converts the raw payload
+    to BGR; MSMF is tried next and returns the untouched stream. Every
     combination is validated before it is accepted.
     """
     if sys.platform.startswith("win"):
-        return [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
     if sys.platform == "darwin":
         return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
     return [cv2.CAP_V4L2, cv2.CAP_ANY]
@@ -121,12 +119,21 @@ def has_thermal_geometry(shape: tuple) -> bool:
     fixes -- one is a driver problem, the other means look at another index.
     """
     expected_bytes = SENSOR_WIDTH * FRAME_HEIGHT * 2
-    if len(shape) == 3 and shape[0] == FRAME_HEIGHT and shape[1] == SENSOR_WIDTH:
-        return True                                   # (384, 256, n)
+    if len(shape) == 3 and shape[1] == SENSOR_WIDTH:
+        extra_rows = shape[0] - FRAME_HEIGHT
+        if 0 <= extra_rows <= 16 and extra_rows % 2 == 0:
+            return True                               # raw, converted, or padded
     if len(shape) == 2:
         rows, cols = shape
-        if rows * cols in (expected_bytes, expected_bytes // 2):
+        size = rows * cols
+        if size in (expected_bytes, expected_bytes // 2):
             return True                               # flat, or uint16-packed
+        row_bytes = SENSOR_WIDTH * 2
+        if rows == 1 and size % row_bytes == 0:
+            padded_rows = size // row_bytes
+            extra_rows = padded_rows - FRAME_HEIGHT
+            if 0 < extra_rows <= 16 and extra_rows % 2 == 0:
+                return True                           # symmetric sensor padding
     return False
 
 
@@ -242,8 +249,16 @@ class ThermalCamera:
                     f"No video device matched name {self.name!r}.\n"
                     f"Devices the system reports:\n{listing}")
 
-        indices = [index] if index is not None \
-            else list(range(self.max_scan_index))
+        if index is not None:
+            indices = [index]
+        else:
+            available = [device for device in self.devices if device.index is not None]
+            thermal = [device.index for device in available if device.looks_thermal]
+            unknown = [device.index for device in available
+                       if not device.looks_thermal and "webcam" not in device.name.lower()]
+            webcams = [device.index for device in available
+                       if not device.looks_thermal and "webcam" in device.name.lower()]
+            indices = thermal + unknown + webcams or list(range(self.max_scan_index))
         backends = [self.backend] if self.backend is not None \
             else _platform_backends()
         strategies = [s for s in STRATEGIES
@@ -522,12 +537,24 @@ def find_cameras(max_index: int = 10, verbose: bool = False) -> list[dict]:
     # built-in webcam from a thermal camera, and with several attached the
     # numbering shifts between reboots.
     try:
-        named = {d.index: d.name for d in list_video_devices()
-                 if d.index is not None}
+        named_devices = {d.index: d for d in list_video_devices()
+                         if d.index is not None}
     except Exception:
-        named = {}
+        named_devices = {}
+    named = {index: device.name for index, device in named_devices.items()}
 
-    for index in range(max_index):
+    if named_devices:
+        thermal_indices = [i for i, device in named_devices.items()
+                           if device.looks_thermal]
+        unknown_indices = [i for i, device in named_devices.items()
+                           if not device.looks_thermal and "webcam" not in device.name.lower()]
+        webcam_indices = [i for i, device in named_devices.items()
+                          if not device.looks_thermal and "webcam" in device.name.lower()]
+        indices = thermal_indices + unknown_indices + webcam_indices
+    else:
+        indices = list(range(max_index))
+
+    for index in indices:
         entry = {"index": index, "name": named.get(index, ""),
                  "backend": "-", "strategy": "-",
                  "thermal": False, "note": "responded, but not a thermal camera"}

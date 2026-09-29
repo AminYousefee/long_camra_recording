@@ -119,23 +119,16 @@ def _list_devices() -> int:
 
     if not any(d.looks_thermal and d.addressable for d in devices):
         print()
-        print("  Nothing here looks like a TOPDON/InfiRay thermal camera.")
-        print("  Expected a name such as 'USB Camera', 'TOPDON' or 'InfiRay'.")
-        if any(d.is_hello_ir for d in devices):
-            print("  Note: the 'IR' camera listed above is Windows Hello face")
-            print("  unlock, built into the laptop. It is easy to mistake for")
-            print("  the thermal camera in Device Manager, but it is not one.")
-        print("  So the TC001 is not reaching Windows' capture layer at all.")
-        print()
-        print("  To find out whether Windows sees the hardware at all, run:")
-        print("      python -m thermalcam.probe --detect")
+        if openable:
+            print("  No device name identifies a thermal camera.")
+            print("  Generic USB/UVC names need frame validation; run:")
+            print("      python -m thermalcam.probe")
+        else:
+            print("  No addressable video camera was found.")
+            if _sys.platform.startswith("win"):
+                print("  To check whether Windows sees the hardware, run:")
+                print("      python -m thermalcam.probe --detect")
 
-    if _sys.platform.startswith("win") and not any(
-            d.source == "DirectShow" for d in devices):
-        print()
-        print("  These came from Windows' device list, not from the capture")
-        print("  subsystem, so there is no index mapping. Install pygrabber to")
-        print("  get the indices OpenCV actually uses:  pip install pygrabber")
     return 0
 
 

@@ -82,24 +82,44 @@ def normalize_buffer(frame: np.ndarray, sensor_height: int = SENSOR_HEIGHT,
     if frame.ndim == 2 and frame.dtype == np.uint16:
         rows, cols = frame.shape
         if rows >= total_rows and cols >= sensor_width:
-            frame = frame.view(np.uint8).reshape(rows, cols, 2)
+            extra_rows = rows - total_rows
+            start = extra_rows // 2 if extra_rows <= 16 and extra_rows % 2 == 0 else 0
+            frame = frame.view(np.uint8).reshape(rows, cols, 2)[
+                start:start + total_rows]
+
+    if frame.ndim == 3 and frame.shape[2] == 2:
+        extra_rows = frame.shape[0] - total_rows
+        if 0 <= extra_rows <= 16 and extra_rows % 2 == 0:
+            start = extra_rows // 2
+            frame = frame[start:start + total_rows]
 
     # Flattened / stride-padded layout -> fold back into rows.
     if frame.ndim == 2:
         flat = np.ascontiguousarray(frame).reshape(-1)
-        if flat.size % total_rows != 0:
-            raise FrameLayoutError(
-                f"Cannot reshape flat buffer of {flat.size} bytes into "
-                f"{total_rows} rows (shape={frame.shape}, dtype={frame.dtype})."
-            )
-        bytes_per_row = flat.size // total_rows
-        if bytes_per_row % 2 != 0 or bytes_per_row // 2 < sensor_width:
-            raise FrameLayoutError(
-                f"Unexpected row stride: {bytes_per_row} bytes/row for a "
-                f"{sensor_width}px-wide sensor."
-            )
-        frame = flat.reshape(total_rows, bytes_per_row // 2, 2)
-        frame = frame[:, :sensor_width, :]
+        row_bytes = sensor_width * 2
+        if frame.shape[0] == 1 and flat.size % row_bytes == 0:
+            source_rows = flat.size // row_bytes
+            extra_rows = source_rows - total_rows
+            if 0 <= extra_rows <= 16 and extra_rows % 2 == 0:
+                start = extra_rows // 2
+                frame = flat.reshape(source_rows, sensor_width, 2)[
+                    start:start + total_rows]
+
+        if frame.ndim == 2:
+            flat = np.ascontiguousarray(frame).reshape(-1)
+            if flat.size % total_rows != 0:
+                raise FrameLayoutError(
+                    f"Cannot reshape flat buffer of {flat.size} bytes into "
+                    f"{total_rows} rows (shape={frame.shape}, dtype={frame.dtype})."
+                )
+            bytes_per_row = flat.size // total_rows
+            if bytes_per_row % 2 != 0 or bytes_per_row // 2 < sensor_width:
+                raise FrameLayoutError(
+                    f"Unexpected row stride: {bytes_per_row} bytes/row for a "
+                    f"{sensor_width}px-wide sensor."
+                )
+            frame = flat.reshape(total_rows, bytes_per_row // 2, 2)
+            frame = frame[:, :sensor_width, :]
 
     if frame.ndim != 3 or frame.shape[2] != 2:
         raise FrameLayoutError(

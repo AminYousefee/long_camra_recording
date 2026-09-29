@@ -12,9 +12,12 @@ This module asks the operating system what is actually there.
 Windows
     ``pygrabber`` (pip install pygrabber) enumerates DirectShow devices in the
     same order OpenCV's CAP_DSHOW backend uses, so position in that list *is*
-    the OpenCV index. Without it we fall back to PowerShell, which gives names
-    and driver status but no index mapping -- still enough to answer "does
-    Windows consider this a camera at all?"
+    the OpenCV index. If it is unavailable, FFmpeg's DirectShow listing gives
+    device names and indices; PowerShell is the final names-only fallback.
+
+macOS
+    FFmpeg's AVFoundation listing gives device names and indices; OpenCV is a
+    fallback when FFmpeg enumeration is unavailable.
 
 Linux
     /sys/class/video4linux/video*/name, where the videoN number is the index.
@@ -23,6 +26,7 @@ Linux
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -30,10 +34,10 @@ from typing import Optional
 
 #: Substrings that identify a TC001-class thermal camera by device name.
 #: The TC001 usually enumerates under the InfiRay sensor module's name rather
-#: than TOPDON's, since TOPDON rebadge InfiRay hardware. "USB Camera" is the
-#: generic name these modules most often present.
+#: than TOPDON's, since TOPDON rebadge InfiRay hardware. Generic USB-camera
+#: names are intentionally not enough to classify a device as thermal.
 THERMAL_NAME_HINTS = ("topdon", "tc001", "ts001", "infiray", "thermal",
-                      "xtherm", "p2 pro", "usb camera")
+                      "xtherm", "p2 pro")
 
 #: Names that contain a thermal-sounding word but are definitely not our camera.
 #: Windows Hello face-recognition modules enumerate as "IR Webcam" or similar,
@@ -84,16 +88,39 @@ class VideoDevice:
 
 # --- Windows -----------------------------------------------------------------
 
+def _windows_ffmpeg() -> list[VideoDevice]:
+    """Enumerate DirectShow cameras with FFmpeg when pygrabber is unavailable."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return []
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    devices = []
+    for line in (result.stdout + result.stderr).splitlines():
+        match = re.search(r'\[dshow @ [^\]]+\]\s+"(.+)" \(video\)\s*$', line)
+        if match:
+            devices.append(VideoDevice(index=len(devices), name=match.group(1),
+                                       source="DirectShow/FFmpeg"))
+    return devices
+
+
 def _windows_directshow() -> list[VideoDevice]:
-    """DirectShow devices in OpenCV's CAP_DSHOW index order, via pygrabber."""
+    """DirectShow devices in OpenCV's index order, via pygrabber or FFmpeg."""
     try:
         from pygrabber.dshow_graph import FilterGraph
     except Exception:
-        return []
+        return _windows_ffmpeg()
     try:
         names = FilterGraph().get_input_devices()
     except Exception:
-        return []
+        return _windows_ffmpeg()
+    if not names:
+        return _windows_ffmpeg()
     return [VideoDevice(index=i, name=name, source="DirectShow")
             for i, name in enumerate(names)]
 
@@ -273,22 +300,66 @@ def _linux_v4l2() -> list[VideoDevice]:
     return devices
 
 
+def _macos_avfoundation() -> list[VideoDevice]:
+    """Enumerate AVFoundation video inputs using FFmpeg, if available."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "avfoundation", "-i", ""],
+                capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+
+        if result is not None:
+            devices = []
+            in_video_section = False
+            for line in (result.stdout + result.stderr).splitlines():
+                if "AVFoundation video devices:" in line:
+                    in_video_section = True
+                    continue
+                if "AVFoundation audio devices:" in line:
+                    in_video_section = False
+                if not in_video_section:
+                    continue
+                match = re.search(r"\[AVFoundation indev @ [^\]]+\]\s+\[(\d+)\]\s+(.+)$", line)
+                if match:
+                    devices.append(VideoDevice(index=int(match.group(1)),
+                                               name=match.group(2).strip(),
+                                               source="AVFoundation/FFmpeg"))
+            if devices:
+                return devices
+
+    try:
+        import cv2
+    except ImportError:
+        return []
+    devices = []
+    for index in range(10):
+        cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if cap.isOpened():
+            devices.append(VideoDevice(index=index, name=f"Camera {index}",
+                                       source="AVFoundation/OpenCV"))
+        cap.release()
+    return devices
+
+
 # --- Public ------------------------------------------------------------------
 
 def list_video_devices() -> list[VideoDevice]:
     """Every video capture device the OS reports, best effort.
 
-    On Windows the DirectShow list comes first, because those entries carry a
-    usable OpenCV index. The PowerShell list is appended only for devices whose
-    names DirectShow did not already report -- those are the interesting ones,
-    because a camera Windows knows about but DirectShow does not is exactly the
-    "visible in Device Manager, invisible to OpenCV" case.
+    Windows and macOS use their native capture APIs through FFmpeg (with
+    optional platform-specific enumerators preferred when available). Linux
+    uses the V4L2 device nodes.
     """
     if sys.platform.startswith("win"):
         dshow = _windows_directshow()
         known = {d.name.lower() for d in dshow}
         extra = [d for d in _windows_pnp() if d.name.lower() not in known]
         return dshow + extra
+    if sys.platform == "darwin":
+        return _macos_avfoundation()
     return _linux_v4l2()
 
 

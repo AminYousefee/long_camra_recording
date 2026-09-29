@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import re
+import tempfile
 from collections import deque
 from datetime import datetime
 
@@ -21,7 +22,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from thermalcam import Calibration  # noqa: E402
 from thermalcam.decode import SENSOR_HEIGHT, SENSOR_WIDTH  # noqa: E402
-from thermalcam.devices import NOT_THERMAL_NAME_HINTS, THERMAL_NAME_HINTS  # noqa: E402
+from thermalcam.devices import (  # noqa: E402
+    NOT_THERMAL_NAME_HINTS,
+    THERMAL_NAME_HINTS,
+    list_video_devices,
+)
 from thermalcam.render import COLORMAP_NAMES  # noqa: E402
 
 from studio_services import (  # noqa: E402
@@ -183,7 +188,8 @@ class AdvancedRecorderApp:
         self.selected_point = None
 
         # RAM snapshot used by FFmpeg while recording
-        self.shm_snapshot = "/dev/shm/current_snapshot.jpg"
+        snapshot_dir = "/dev/shm" if sys.platform.startswith("linux") else tempfile.gettempdir()
+        self.shm_snapshot = os.path.join(snapshot_dir, "amin_studio_current_snapshot.jpg")
 
         # Devices found by the last scan: list of dicts
         self.devices = []
@@ -657,7 +663,7 @@ class AdvancedRecorderApp:
             row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 8)
         )
 
-        self.res_var = tk.StringVar(value="3840x2160 (4K)")
+        self.res_var = tk.StringVar(value="1920x1080 (1080p)")
         self.res_combo = self.make_combo(self.settings_card, RESOLUTIONS, self.res_var)
         self.add_labeled_control(self.settings_card, 1, "Resolution", self.res_combo)
         self.res_combo.configure(command=lambda _: self.update_storage_stats(schedule_next=False))
@@ -740,7 +746,7 @@ class AdvancedRecorderApp:
             row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 8)
         )
 
-        self.photo_res_var = tk.StringVar(value="3840x2160 (4K)")
+        self.photo_res_var = tk.StringVar(value="1920x1080 (1080p)")
         self.photo_res_combo = self.make_combo(
             card, RESOLUTIONS, self.photo_res_var,
             command=lambda _v: self.update_storage_stats(schedule_next=False),
@@ -1756,6 +1762,21 @@ class AdvancedRecorderApp:
         self.camera_status_label.configure(text="CAMERA: scanning...", text_color=COLORS["text_dim"])
 
         def worker():
+            if sys.platform.startswith("win") or sys.platform == "darwin":
+                found = []
+                for device in list_video_devices():
+                    if not device.addressable:
+                        continue
+                    tag = "  |  THERMAL" if device.looks_thermal else ""
+                    found.append({
+                        "path": str(device.index),
+                        "name": device.name,
+                        "thermal": device.looks_thermal,
+                        "label": f"{device.index} - {device.name}{tag}",
+                    })
+                self.root.after(0, lambda: self._apply_camera_results(found))
+                return
+
             video_nodes = sorted(glob.glob("/dev/video*"), key=lambda p: int(re.sub(r"\D", "", p) or 0))
             found = []
 
@@ -1832,8 +1853,10 @@ class AdvancedRecorderApp:
         cam = self.get_selected_camera_path()
         if not self.use_camera_var.get():
             self.camera_status_label.configure(text="CAMERA: disabled", text_color=COLORS["text_dim"])
-        elif cam and cam.startswith("/dev/"):
-            self.camera_status_label.configure(text=f"CAMERA: {cam}  •  ONLINE", text_color=COLORS["green"])
+        elif self.camera_is_valid():
+            device = next((d for d in self.devices if d["path"] == cam), None)
+            name = device["name"] if device else cam
+            self.camera_status_label.configure(text=f"CAMERA: {name}  •  ONLINE", text_color=COLORS["green"])
         else:
             self.camera_status_label.configure(text="CAMERA: NOT FOUND", text_color=COLORS["red"])
 
@@ -1850,6 +1873,8 @@ class AdvancedRecorderApp:
 
     def camera_is_valid(self):
         cam = self.get_selected_camera_path()
+        if sys.platform.startswith("win") or sys.platform == "darwin":
+            return bool(cam) and cam.isdecimal()
         return bool(cam) and cam.startswith("/dev/")
 
     def on_device_toggle(self):
@@ -2107,20 +2132,38 @@ class AdvancedRecorderApp:
         prev_fps = f"{p['rate_ipm']}/60"
         preview = ["-map", "[prev_out]", "-update", "1", "-y", self.shm_snapshot]
 
-        cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "warning",
-               "-f", "v4l2", "-framerate", p["fps"], "-video_size", p["res"],
-               "-input_format", "mjpeg", "-i", camera]
+        if p["codec"] == "h264_vaapi" and not sys.platform.startswith("linux"):
+            self.show_alert("VAAPI ENCODING IS ONLY AVAILABLE ON LINUX; SELECT LIBX264", "error", 6000)
+            return False
+
+        if sys.platform.startswith("win"):
+            device = next((d for d in self.devices if d["path"] == camera), None)
+            if device is None:
+                self.show_alert("NO VALID CAMERA SELECTED", "error", 5000)
+                return False
+            video_input = ["-f", "dshow", "-framerate", p["fps"],
+                           "-i", f"video={device['name']}"]
+        elif sys.platform == "darwin":
+            video_input = ["-f", "avfoundation", "-framerate", p["fps"],
+                           "-i", camera]
+        else:
+            video_input = ["-f", "v4l2", "-framerate", p["fps"], "-video_size", p["res"],
+                           "-input_format", "mjpeg", "-i", camera]
+        cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "warning", *video_input]
+        output_scale = ""
+        if sys.platform.startswith("win") or sys.platform == "darwin":
+            output_scale = f"scale={p['res'].replace('x', ':')},setsar=1,"
         if p["codec"] == "h264_vaapi":
             cmd += ["-vaapi_device", "/dev/dri/renderD128",
                     "-filter_complex",
-                    f"[0:v]split=2[rec_in][prev_in];"
+                    f"[0:v]{output_scale}split=2[rec_in][prev_in];"
                     f"[rec_in]format=nv12,hwupload[rec_out];"
                     f"[prev_in]fps={prev_fps},scale=640:-1[prev_out]",
                     "-map", "[rec_out]", "-c:v", "h264_vaapi", "-qp", p["crf"], "-g", "60",
                     *segment, *preview]
         else:
             cmd += ["-filter_complex",
-                    f"[0:v]split=2[rec_out][prev_in];"
+                    f"[0:v]{output_scale}split=2[rec_out][prev_in];"
                     f"[prev_in]fps={prev_fps},scale=640:-1[prev_out]",
                     "-map", "[rec_out]", "-c:v", p["codec"], "-preset", p["preset"],
                     "-crf", p["crf"], "-g", "60",
@@ -3024,8 +3067,9 @@ class AdvancedRecorderApp:
         interval = 60.0 / rate_ipm
         start_time = time.time()
         last_frame_time = 0.0
-        cap = None
         use_cam = self.use_camera_var.get()
+        camera_user = "image-preview"
+        camera_acquired = False
 
         if use_cam and not self.is_recording:
             camera = self.get_selected_camera_path()
@@ -3033,8 +3077,9 @@ class AdvancedRecorderApp:
                 self.root.after(0, lambda: self.show_alert("NO VALID CAMERA FOUND", "error", 5000))
                 use_cam = False
             else:
-                cap = cv2.VideoCapture(camera)
-                time.sleep(0.5)
+                width, height = self._photo_resolution()
+                self.camera.acquire(camera_user, camera, width, height)
+                camera_acquired = True
 
         while self.is_image_previewing:
             current_time = time.time()
@@ -3050,19 +3095,17 @@ class AdvancedRecorderApp:
                                 self.root.after(0, self.render_frame_to_preview, frame)
                         except Exception:
                             pass
-                elif cap and cap.isOpened():
-                    for _ in range(4):
-                        cap.grab()
-                    ret, frame = cap.read()
-                    if ret:
+                elif use_cam:
+                    frame = self.camera.snapshot(timeout=10.0)
+                    if frame is not None:
                         self.root.after(0, self.render_frame_to_preview, frame)
                 self._burst_thermal_due = True
                 last_frame_time = current_time
 
             time.sleep(0.05)
 
-        if cap:
-            cap.release()
+        if camera_acquired:
+            self.camera.release(camera_user)
 
         self.is_image_previewing = False
         self.root.after(0, self._reset_image_preview_ui)
