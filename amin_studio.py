@@ -21,6 +21,7 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from thermalcam import Calibration  # noqa: E402
+from thermalcam.camera import has_thermal_geometry  # noqa: E402
 from thermalcam.decode import SENSOR_HEIGHT, SENSOR_WIDTH  # noqa: E402
 from thermalcam.devices import (  # noqa: E402
     NOT_THERMAL_NAME_HINTS,
@@ -29,13 +30,25 @@ from thermalcam.devices import (  # noqa: E402
 )
 from thermalcam.render import COLORMAP_NAMES  # noqa: E402
 
+from platform_utils import (  # noqa: E402
+    IS_LINUX,
+    IS_MAC,
+    IS_WINDOWS,
+    MONO_FAMILY,
+    UI_FAMILY,
+    SystemMonitor,
+    imread,
+    no_window_kwargs,
+    stop_ffmpeg,
+)
 from studio_services import (  # noqa: E402
     COLORBAR_WIDTH,
     SleepInhibitor,
-    camera_controls_auto,
-    camera_controls_lock,
-    camera_controls_manual,
-    camera_controls_read,
+    OpenCVControls,
+    ServiceControls,
+    TemporaryControls,
+    V4L2Controls,
+    have_v4l2_ctl,
     ffmpeg_log_file,
     log,
     setup_logging,
@@ -47,6 +60,7 @@ from studio_services import (  # noqa: E402
     ThermalVideoRecorder,
     TimelapseScheduler,
     describe_step,
+    device_index,
     estimate_shot_bytes,
     estimate_thermal_mbps,
     format_hms,
@@ -76,19 +90,28 @@ COLORS = {
     "black": "#000000",
 }
 
-FONT_UI = ("Segoe UI", 12)
-FONT_UI_SMALL = ("Segoe UI", 10)
-FONT_UI_BOLD = ("Segoe UI", 12, "bold")
-FONT_SECTION = ("Segoe UI", 11, "bold")
-FONT_MONO = ("DejaVu Sans Mono", 11)
-FONT_MONO_BIG = ("DejaVu Sans Mono", 20, "bold")
-FONT_MONO_SMALL = ("DejaVu Sans Mono", 9)
+FONT_UI = (UI_FAMILY, 12)
+FONT_UI_SMALL = (UI_FAMILY, 10)
+FONT_UI_BOLD = (UI_FAMILY, 12, "bold")
+FONT_SECTION = (UI_FAMILY, 11, "bold")
+FONT_MONO = (MONO_FAMILY, 11)
+FONT_MONO_BIG = (MONO_FAMILY, 20, "bold")
+FONT_MONO_SMALL = (MONO_FAMILY, 9)
 
 CONFIG_DIR = os.path.expanduser("~/.config/amin_studio")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 CALIB_PATH = os.path.join(CONFIG_DIR, "calibration.json")
 ACTIVE_RUN_PATH = os.path.join(CONFIG_DIR, "active_run.json")
-AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/amin-studio.desktop")
+if sys.platform.startswith("win"):
+    # a .cmd in the user's Startup folder runs at every login
+    AUTOSTART_PATH = os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~/AppData/Roaming")),
+        "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "amin-studio.cmd")
+elif sys.platform == "darwin":
+    # a LaunchAgent with RunAtLoad starts at every login
+    AUTOSTART_PATH = os.path.expanduser("~/Library/LaunchAgents/com.aminstudio.recorder.plist")
+else:
+    AUTOSTART_PATH = os.path.expanduser("~/.config/autostart/amin-studio.desktop")
 RESUME_DELAY_S = 20
 
 RESOLUTIONS = [
@@ -97,6 +120,14 @@ RESOLUTIONS = [
     "1920x1080 (1080p)",
     "1280x720 (720p)",
 ]
+# Software encoders everywhere, plus the GPU encoder of each OS.
+if IS_WINDOWS:
+    HW_CODEC = "h264_qsv (Intel GPU)"
+elif IS_MAC:
+    HW_CODEC = "h264_videotoolbox (Apple GPU)"
+else:
+    HW_CODEC = "h264_vaapi (Intel GPU)"
+CODEC_CHOICES = ["libx264 (Standard CPU)", "libx265 (High Compression)", HW_CODEC]
 SHOTS_PRESETS = ["1", "2", "3", "4", "6", "8", "12", "24", "48", "96", "144", "288", "720", "1440"]
 THERMAL_DATA_CHOICES = {
     "NPY  (°C float32)": "npy",
@@ -162,6 +193,7 @@ class AdvancedRecorderApp:
 
         # Recording state
         self.ffmpeg_proc = None
+        self._input_simple = False
         self.start_time = None
         self.is_recording = False
         self.thermal_recorder = None
@@ -176,8 +208,10 @@ class AdvancedRecorderApp:
 
         # Preview state
         self.is_streaming = False
+        self._stream_gen = 0
         self.stream_thread = None
         self.is_image_previewing = False
+        self._burst_gen = 0
         self.image_preview_thread = None
         self.thermal_frozen = False
         self._frozen_celsius = None
@@ -200,6 +234,7 @@ class AdvancedRecorderApp:
         self.camera = CameraService()
         self.capturer = PhotoCapturer(self.camera, self.thermal, self.pipeline)
         self.camera.on_ready = self._camera_ready_hook
+        self.sysmon = SystemMonitor()
 
         # System telemetry is completely opt-in.
         self.is_telemetry_active = False
@@ -244,6 +279,7 @@ class AdvancedRecorderApp:
         self.root.bind_all("<Key>", self.on_key, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(1500, self._check_resume)
+        self.root.after(800, self._check_ffmpeg)
 
     # ------------------------------------------------------------------
     # UI helpers
@@ -416,7 +452,7 @@ class AdvancedRecorderApp:
         self.status_dot = ctk.CTkLabel(
             status_box,
             text="●",
-            font=("Segoe UI", 22),
+            font=(UI_FAMILY, 22),
             text_color=COLORS["text_dim"],
             width=20,
         )
@@ -425,7 +461,7 @@ class AdvancedRecorderApp:
         self.status_text = ctk.CTkLabel(
             status_box,
             text="SYSTEM READY",
-            font=("Segoe UI", 14, "bold"),
+            font=(UI_FAMILY, 14, "bold"),
             text_color=COLORS["text"],
             anchor="w",
         )
@@ -454,7 +490,7 @@ class AdvancedRecorderApp:
         ctk.CTkLabel(
             title_box,
             text="4K + THERMAL DATA LOGGER",
-            font=("Segoe UI", 18, "bold"),
+            font=(UI_FAMILY, 18, "bold"),
             text_color=COLORS["text"],
         ).pack()
         self.subtitle_label = ctk.CTkLabel(
@@ -673,15 +709,7 @@ class AdvancedRecorderApp:
         self.add_labeled_control(self.settings_card, 2, "Framerate", self.fps_combo)
 
         self.codec_var = tk.StringVar(value="libx264 (Standard CPU)")
-        self.codec_combo = self.make_combo(
-            self.settings_card,
-            [
-                "libx264 (Standard CPU)",
-                "libx265 (High Compression)",
-                "h264_vaapi (Intel GPU)",
-            ],
-            self.codec_var,
-        )
+        self.codec_combo = self.make_combo(self.settings_card, CODEC_CHOICES, self.codec_var)
         self.add_labeled_control(self.settings_card, 3, "Codec", self.codec_combo)
 
         self.preset_var = tk.StringVar(value="veryfast")
@@ -1126,7 +1154,7 @@ class AdvancedRecorderApp:
         self.uptime_label = ctk.CTkLabel(
             self.action_card,
             text="00:00:00",
-            font=("DejaVu Sans Mono", 28, "bold"),
+            font=(MONO_FAMILY, 28, "bold"),
             text_color=COLORS["text"],
         )
         self.uptime_label.grid(row=1, column=0, padx=14, pady=(4, 0))
@@ -1176,7 +1204,7 @@ class AdvancedRecorderApp:
         self.countdown_label = ctk.CTkLabel(
             card,
             text="--:--:--",
-            font=("DejaVu Sans Mono", 28, "bold"),
+            font=(MONO_FAMILY, 28, "bold"),
             text_color=COLORS["text"],
         )
         self.countdown_label.grid(row=1, column=0, columnspan=2, padx=14, pady=(4, 0))
@@ -1297,6 +1325,10 @@ class AdvancedRecorderApp:
         self.thermal_display.bind("<Button-1>", self.on_thermal_click)
         self.thermal_display.bind("<Double-Button-1>", lambda _e: self.prompt_point_value())
         self.thermal_display.bind("<Button-3>", self.on_thermal_right_click)
+        if IS_MAC:
+            # Aqua Tk reports the right button as Button-2; Ctrl-click too
+            self.thermal_display.bind("<Button-2>", self.on_thermal_right_click)
+            self.thermal_display.bind("<Control-Button-1>", self.on_thermal_right_click)
         self.thermal_display.bind("<Motion>", self.on_thermal_motion)
         self.thermal_display.bind("<Leave>", lambda _e: setattr(self, "_thermal_cursor", None))
         self.preview_display.bind("<Button-1>", lambda _e: self.root.focus_set())
@@ -1412,7 +1444,7 @@ class AdvancedRecorderApp:
         value_label = ctk.CTkLabel(
             header,
             text="0.0%",
-            font=("DejaVu Sans Mono", 16, "bold"),
+            font=(MONO_FAMILY, 16, "bold"),
             text_color=color,
         )
         value_label.grid(row=0, column=1, sticky="e")
@@ -1562,41 +1594,10 @@ class AdvancedRecorderApp:
     # System telemetry
     # ------------------------------------------------------------------
     def _read_ram_percent(self):
-        with open("/proc/meminfo", "r") as f:
-            mem_total = 0
-            mem_available = 0
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    mem_total = int(line.split()[1])
-                elif line.startswith("MemAvailable:"):
-                    mem_available = int(line.split()[1])
-                if mem_total and mem_available:
-                    break
-        if not mem_total:
-            return 0.0
-        return 100.0 - (mem_available / mem_total * 100.0)
+        return self.sysmon.ram_percent()
 
     def _read_cpu_percent(self):
-        with open("/proc/stat", "r") as f:
-            values = list(map(int, f.readline().split()[1:8]))
-
-        idle = values[3] + values[4]
-        total = sum(values)
-        current = (total, idle)
-
-        if self._last_cpu_sample is None:
-            self._last_cpu_sample = current
-            return 0.0
-
-        prev_total, prev_idle = self._last_cpu_sample
-        self._last_cpu_sample = current
-
-        total_diff = total - prev_total
-        idle_diff = idle - prev_idle
-        if total_diff <= 0:
-            return 0.0
-
-        return max(0.0, min(100.0, 100.0 * (total_diff - idle_diff) / total_diff))
+        return self.sysmon.cpu_percent()
 
     def toggle_system_telemetry(self):
         if self.is_telemetry_active:
@@ -1761,18 +1762,45 @@ class AdvancedRecorderApp:
         self.cam_combo.set("Scanning cameras...")
         self.camera_status_label.configure(text="CAMERA: scanning...", text_color=COLORS["text_dim"])
 
+        # Probing opens devices, so only when nothing of ours has one open.
+        may_probe = not (self.is_streaming or self.is_image_previewing
+                         or self.camera.running or self.thermal.running)
+
         def worker():
-            if sys.platform.startswith("win") or sys.platform == "darwin":
+            by_name = sys.platform.startswith("win") or sys.platform == "darwin"
+            no_v4l2 = IS_LINUX and not shutil.which("v4l2-ctl")
+            if by_name or no_v4l2:
+                if no_v4l2:
+                    # no v4l-utils: names from sysfs, metadata nodes left out
+                    devices = [d for d in list_video_devices() if self._is_capture_node(d.index)]
+                    path_of = lambda i: f"/dev/video{i}"  # noqa: E731
+                else:
+                    devices = [d for d in list_video_devices() if d.addressable]
+                    path_of = str
+                thermal_idx = {d.index for d in devices if d.looks_thermal}
+                if not thermal_idx and may_probe:
+                    # On Windows the TC001 usually enumerates under a generic
+                    # name ("USB Camera"), which says nothing. Its frame size
+                    # does: 256 px wide, which no ordinary webcam uses.
+                    for d in devices:
+                        low = d.name.lower()
+                        if d.is_hello_ir or "virtual" in low:
+                            continue
+                        if self._probe_thermal_geometry(d.index):
+                            thermal_idx.add(d.index)
+                            log.info("device %d (%s) streams 256 px wide: treating it as the thermal camera",
+                                     d.index, d.name)
+                            break
                 found = []
-                for device in list_video_devices():
-                    if not device.addressable:
-                        continue
-                    tag = "  |  THERMAL" if device.looks_thermal else ""
+                for device in devices:
+                    thermal = device.index in thermal_idx
+                    tag = "  |  THERMAL" if thermal else ""
+                    path = path_of(device.index)
                     found.append({
-                        "path": str(device.index),
+                        "path": path,
                         "name": device.name,
-                        "thermal": device.looks_thermal,
-                        "label": f"{device.index} - {device.name}{tag}",
+                        "thermal": thermal,
+                        "label": f"{path} - {device.name}{tag}",
                     })
                 self.root.after(0, lambda: self._apply_camera_results(found))
                 return
@@ -1824,6 +1852,38 @@ class AdvancedRecorderApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    @staticmethod
+    def _is_capture_node(index):
+        """Linux: UVC cameras expose a second /dev/video node for metadata;
+        only the one with sysfs index 0 delivers frames."""
+        try:
+            with open(f"/sys/class/video4linux/video{index}/index") as f:
+                return f.read().strip() == "0"
+        except OSError:
+            return True
+
+    @staticmethod
+    def _probe_thermal_geometry(index):
+        """Open a camera briefly and report whether it streams the TC001's
+        256-px-wide frames (256x384 YUY2, or 256x192)."""
+        backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+        cap = None
+        try:
+            cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                return False
+            for _ in range(4):
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    return has_thermal_geometry(frame.shape) or frame.shape[1] == SENSOR_WIDTH
+            return int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) == SENSOR_WIDTH
+        except Exception:
+            return False
+        finally:
+            if cap is not None:
+                cap.release()
+                time.sleep(0.3)      # Windows frees the handle asynchronously
+
     def _apply_camera_results(self, found):
         self.devices = found
         labels = [d["label"] for d in found]
@@ -1835,7 +1895,9 @@ class AdvancedRecorderApp:
 
         if labels:
             self.cam_combo.configure(values=labels)
-            pick = next((d["label"] for d in found if d["path"] == wanted_cam), None)
+            # Never default the normal camera to the thermal one (a saved
+            # setting may point there from an earlier, wrong automatic pick).
+            pick = next((d["label"] for d in normal if d["path"] == wanted_cam), None)
             pick = pick or (normal[0]["label"] if normal else labels[0])
             self.cam_combo.set(pick)
         else:
@@ -1890,10 +1952,19 @@ class AdvancedRecorderApp:
 
     def on_device_change(self):
         self._update_device_status()
-        if self.is_streaming:
-            # Restart the preview on the newly chosen device(s).
-            self.toggle_live_stream()
-            self.toggle_live_stream()
+        if not (self.is_streaming or self.is_image_previewing) or self.is_recording or self.is_timelapse:
+            return
+        cam, th = self.get_selected_camera_path(), self.get_selected_thermal_path()
+        if self.use_camera_var.get() and self.use_thermal_var.get() and self._same_device(cam, th):
+            self.show_alert("CAMERA AND THERMAL CAMERA ARE THE SAME DEVICE  •  "
+                            "PICK THE OTHER CAMERA IN THE CAMERA LIST", "error", 7000)
+            return
+        # acquire() only restarts a service whose device actually changed.
+        if self.use_thermal_var.get():
+            user = "preview" if self.is_streaming else "image-preview"
+            self.thermal.acquire(user, th, avoid=self._thermal_avoid())
+        if self.is_streaming and self.use_camera_var.get() and self.camera_is_valid():
+            self._acquire_preview_camera()
 
     # ------------------------------------------------------------------
     # Storage
@@ -1913,16 +1984,17 @@ class AdvancedRecorderApp:
         except ValueError:
             return 25.0
 
+    @staticmethod
+    def _camera_bitrate_mbps(p):
+        w, h = map(int, p["res"].split("x"))
+        base_mbps = 2.0 * (2 ** ((23 - float(p["crf"])) / 6))
+        return max(0.5, base_mbps * (w * h) / (1920 * 1080))
+
     def estimate_bitrate_mbps(self):
         total = 0.0
         if self.use_camera_var.get():
-            res_str = self.res_var.get().split()[0]
-            w, h = map(int, res_str.split("x"))
-            crf = float(self.crf_var.get())
-            base_pixels = 1920 * 1080
-            scale = (w * h) / base_pixels
-            base_mbps = 2.0 * (2 ** ((23 - crf) / 6))
-            total += max(0.5, base_mbps * scale)
+            total += self._camera_bitrate_mbps({"res": self.res_var.get().split()[0],
+                                                "crf": self.crf_var.get()})
         if self.use_thermal_var.get():
             total += estimate_thermal_mbps(self._thermal_video_outputs(), self._thermal_fps())
         return max(total, 0.05)
@@ -2059,11 +2131,6 @@ class AdvancedRecorderApp:
     def start_recording(self, resumed=False):
         self.hide_alert()
 
-        if self.is_streaming:
-            self.toggle_live_stream()
-        if self.is_image_previewing:
-            self.toggle_image_preview()
-
         use_cam = self.use_camera_var.get()
         use_th = self.use_thermal_var.get()
         if not use_cam and not use_th:
@@ -2074,7 +2141,7 @@ class AdvancedRecorderApp:
         if use_cam and not self.camera_is_valid():
             self.show_alert("NO VALID CAMERA SELECTED", "error", 5000)
             return
-        if use_cam and use_th and camera == self.get_selected_thermal_path():
+        if use_cam and use_th and self._same_device(camera, self.get_selected_thermal_path()):
             self.show_alert("CAMERA AND THERMAL CAMERA ARE THE SAME DEVICE", "error", 5000)
             return
 
@@ -2091,7 +2158,25 @@ class AdvancedRecorderApp:
         self._attach_log(p["out_dir"])
         self._rec_params = p
 
+        # Hold the thermal camera across the preview -> recording switch, so
+        # stopping the preview does not close it only for it to be re-opened.
+        if use_th:
+            self.thermal.acquire("record", self.get_selected_thermal_path(),
+                                 avoid=self._thermal_avoid())
+        if self.is_streaming:
+            self.toggle_live_stream()
+        if self.is_image_previewing:
+            self.toggle_image_preview()
+        if use_cam:
+            # FFmpeg opens the camera itself: our preview must have let go.
+            self.camera.wait_closed(timeout=5.0)
+
+        self._input_simple = False
+        if use_cam and not have_v4l2_ctl():
+            self._apply_controls_before_ffmpeg(camera, fresh=True)
         if use_cam and not self._start_camera_ffmpeg():
+            if use_th:
+                self.thermal.release("record")
             return
 
         if use_th:
@@ -2104,7 +2189,7 @@ class AdvancedRecorderApp:
         log.info("RECORDING STARTED%s  %s  -> %s  (%s %s fps %s crf %s, chunks %d min, prefix %s)",
                  " (resumed)" if resumed else "", what, p["out_dir"], p["res"], p["fps"],
                  p["codec"], p["crf"], p["chunk_sec"] // 60, p["prefix"])
-        if use_cam:
+        if use_cam and have_v4l2_ctl():
             # Once the stream runs, lock / set exposure etc. if requested.
             self.root.after(4000, lambda: self._apply_camera_controls_async(camera, fresh=True))
 
@@ -2132,20 +2217,32 @@ class AdvancedRecorderApp:
         prev_fps = f"{p['rate_ipm']}/60"
         preview = ["-map", "[prev_out]", "-update", "1", "-y", self.shm_snapshot]
 
-        if p["codec"] == "h264_vaapi" and not sys.platform.startswith("linux"):
-            self.show_alert("VAAPI ENCODING IS ONLY AVAILABLE ON LINUX; SELECT LIBX264", "error", 6000)
-            return False
-
         if sys.platform.startswith("win"):
             device = next((d for d in self.devices if d["path"] == camera), None)
             if device is None:
                 self.show_alert("NO VALID CAMERA SELECTED", "error", 5000)
                 return False
-            video_input = ["-f", "dshow", "-framerate", p["fps"],
-                           "-i", f"video={device['name']}"]
+            # DirectShow opens cameras by NAME. If two share it (the TC001 and
+            # a webcam are both often just "USB Camera"), -video_device_number
+            # picks the right one; without it FFmpeg takes the first -- possibly
+            # the thermal camera, which then stops in the thermal pipeline.
+            same_name = [d for d in self.devices if d["name"] == device["name"]]
+            dev_number = same_name.index(device)
+            video_input = ["-f", "dshow", "-rtbufsize", "512M"]
+            if not self._input_simple:
+                # Ask for the real resolution in MJPEG instead of the camera's
+                # default mode (often 640x480) upscaled to the chosen size.
+                video_input += ["-video_size", p["res"], "-vcodec", "mjpeg"]
+            video_input += ["-framerate", p["fps"]]
+            if dev_number:
+                video_input += ["-video_device_number", str(dev_number)]
+            video_input += ["-i", f"video={device['name']}"]
         elif sys.platform == "darwin":
-            video_input = ["-f", "avfoundation", "-framerate", p["fps"],
-                           "-i", camera]
+            video_input = ["-f", "avfoundation"]
+            if not self._input_simple:
+                video_input += ["-video_size", p["res"]]
+            # "N:none" = video device N, no audio
+            video_input += ["-framerate", p["fps"], "-i", f"{camera}:none"]
         else:
             video_input = ["-f", "v4l2", "-framerate", p["fps"], "-video_size", p["res"],
                            "-input_format", "mjpeg", "-i", camera]
@@ -2153,7 +2250,11 @@ class AdvancedRecorderApp:
         output_scale = ""
         if sys.platform.startswith("win") or sys.platform == "darwin":
             output_scale = f"scale={p['res'].replace('x', ':')},setsar=1,"
-        if p["codec"] == "h264_vaapi":
+        codec = p["codec"]
+        if codec == "h264_vaapi" and not IS_LINUX:
+            self.show_alert("VAAPI ENCODING IS ONLY AVAILABLE ON LINUX; SELECT LIBX264", "error", 6000)
+            return False
+        if codec == "h264_vaapi":
             cmd += ["-vaapi_device", "/dev/dri/renderD128",
                     "-filter_complex",
                     f"[0:v]{output_scale}split=2[rec_in][prev_in];"
@@ -2162,17 +2263,35 @@ class AdvancedRecorderApp:
                     "-map", "[rec_out]", "-c:v", "h264_vaapi", "-qp", p["crf"], "-g", "60",
                     *segment, *preview]
         else:
+            if codec == "h264_qsv":
+                enc = ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", p["crf"],
+                       "-look_ahead", "0"]
+                fmt = "format=nv12,"
+            elif codec == "h264_videotoolbox":
+                # VideoToolbox has no CRF: use the bitrate the storage estimate assumes
+                mbps = max(1.0, self._camera_bitrate_mbps(p))
+                enc = ["-c:v", "h264_videotoolbox", "-b:v", f"{mbps:.1f}M",
+                       "-maxrate", f"{mbps * 1.5:.1f}M", "-bufsize", f"{mbps * 2:.1f}M",
+                       "-allow_sw", "1"]
+                fmt = "format=yuv420p,"
+            else:
+                enc = ["-c:v", codec, "-preset", p["preset"], "-crf", p["crf"]]
+                fmt = ""
             cmd += ["-filter_complex",
-                    f"[0:v]{output_scale}split=2[rec_out][prev_in];"
+                    f"[0:v]{output_scale}split=2[rec_raw][prev_in];"
+                    f"[rec_raw]{fmt}null[rec_out];"
                     f"[prev_in]fps={prev_fps},scale=640:-1[prev_out]",
-                    "-map", "[rec_out]", "-c:v", p["codec"], "-preset", p["preset"],
-                    "-crf", p["crf"], "-g", "60",
+                    "-map", "[rec_out]", *enc, "-g", "60",
                     *segment, *preview]
         try:
+            # stdin is a pipe so the recording can be ended with "q" (FFmpeg's
+            # clean exit) -- the only way to finalise the file on Windows.
             self.ffmpeg_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL,
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=ffmpeg_log_file(self._log_dir, "ffmpeg_camera.log"),
+                **no_window_kwargs(),
             )
+            self._ffmpeg_started_at = time.time()
             return True
         except Exception as exc:
             log.error("camera ffmpeg failed to start: %s", exc)
@@ -2180,7 +2299,7 @@ class AdvancedRecorderApp:
             return False
 
     def _start_thermal_recorder(self, p):
-        self.thermal.acquire("record", self.get_selected_thermal_path())
+        self.thermal.acquire("record", self.get_selected_thermal_path(), avoid=self._thermal_avoid())
         preset = p["preset"] if p["preset"] in ("ultrafast", "superfast", "veryfast", "faster",
                                                 "fast", "medium") else "veryfast"
         self.thermal_recorder = ThermalVideoRecorder(
@@ -2227,11 +2346,7 @@ class AdvancedRecorderApp:
             self._camera_retry_id = None
 
         if self.ffmpeg_proc:
-            self.ffmpeg_proc.terminate()
-            try:
-                self.ffmpeg_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.ffmpeg_proc.kill()
+            stop_ffmpeg(self.ffmpeg_proc, timeout=10)
             self.ffmpeg_proc = None
 
         self._stop_thermal_recorder()
@@ -2266,6 +2381,13 @@ class AdvancedRecorderApp:
         code = self.ffmpeg_proc.returncode
         self.ffmpeg_proc = None
         self._camera_restarts += 1
+        if ((IS_WINDOWS or IS_MAC) and not self._input_simple
+                and time.time() - getattr(self, "_ffmpeg_started_at", 0) < 8):
+            # Died right away: most likely the camera has no mode at this size
+            # (or no MJPEG). Fall back to its default mode, scaled to the size.
+            self._input_simple = True
+            log.warning("camera ffmpeg exited at once with MJPEG %s; retrying with the "
+                        "camera's default format", (self._rec_params or {}).get("res"))
         log.error("camera ffmpeg exited (code %s); restart #%d in 2 s -- see logs/ffmpeg_camera.log",
                   code, self._camera_restarts)
         self.status_text.configure(text="RECOVERING", text_color=COLORS["amber"])
@@ -2277,12 +2399,16 @@ class AdvancedRecorderApp:
         self._camera_retry_id = None
         if not self.is_recording:
             return
+        if not have_v4l2_ctl():
+            # re-apply the same (locked / manual) values before FFmpeg re-opens
+            self._apply_controls_before_ffmpeg(self.get_selected_camera_path(), fresh=False)
         if self._start_camera_ffmpeg():
             self.status_text.configure(text="RECORDING ACTIVE", text_color=COLORS["red"])
             self.status_dot.configure(text_color=COLORS["red"])
             log.info("camera ffmpeg restarted")
-            self.root.after(4000, lambda: self._apply_camera_controls_async(
-                self.get_selected_camera_path(), fresh=False))
+            if have_v4l2_ctl():
+                self.root.after(4000, lambda: self._apply_camera_controls_async(
+                    self.get_selected_camera_path(), fresh=False))
         else:
             self._camera_retry_id = self.root.after(10000, self._retry_camera_ffmpeg)
 
@@ -2372,7 +2498,50 @@ class AdvancedRecorderApp:
             self._log_heartbeat()
         self.root.after(1000, self.update_timer_loop)
 
+    def _adopt_detected_thermal(self):
+        """Once the thermal camera is identified (it opened, or the normal
+        camera found itself pointed at a 256-px-wide device), make the device
+        lists say which index it is -- and move the normal camera off it."""
+        idx = self.thermal.found_index if self.thermal.status == "ONLINE" else None
+        if idx is None and self.camera.thermal_index is not None:
+            idx = self.camera.thermal_index
+            self.camera.thermal_index = None
+            self._adopted_thermal_index = None       # act on it even if seen before
+        if idx is None or idx == getattr(self, "_adopted_thermal_index", None):
+            return
+        self._adopted_thermal_index = idx
+        dev = next((d for d in self.devices if device_index(d["path"]) == idx), None)
+        if dev is None:
+            return
+        if not dev["thermal"]:
+            dev["thermal"] = True
+            dev["label"] = f"{dev['path']} - {dev['name']}  |  THERMAL"
+            labels = [d["label"] for d in self.devices]
+            cam_sel, th_sel = self.get_selected_camera_path(), self.get_selected_thermal_path()
+            self.cam_combo.configure(values=labels)
+            self.thermal_combo.configure(values=["Auto-detect"] + labels)
+            for combo, path in ((self.cam_combo, cam_sel), (self.thermal_combo, th_sel)):
+                lab = next((d["label"] for d in self.devices if d["path"] == path), None)
+                if lab:
+                    combo.set(lab)
+            log.info("thermal camera found at %s (%s)", dev["path"], dev["name"])
+        if self.get_selected_thermal_path() is None:
+            self.thermal_combo.set(dev["label"])
+        if self._same_device(self.get_selected_camera_path(), dev["path"]):
+            other = next((d for d in self.devices if not d["thermal"]), None)
+            if other is not None and not (self.is_recording or self.is_timelapse):
+                self.cam_combo.set(other["label"])
+                self.show_alert(f"THE NORMAL CAMERA WAS SET TO THE THERMAL CAMERA  •  SWITCHED IT TO "
+                                f"{other['name'].upper()}", "warning", 6000)
+                if self.is_streaming and self.use_camera_var.get():
+                    self._acquire_preview_camera()
+                if self.thermal.running:
+                    # let the thermal scan (which skipped the "camera") try it now
+                    self.thermal.avoid = set(self._thermal_avoid())
+        self._update_device_status()
+
     def _update_thermal_status(self):
+        self._adopt_detected_thermal()
         if not self.use_thermal_var.get():
             self.thermal_status_label.configure(text="THERMAL: disabled", text_color=COLORS["text_dim"])
             return
@@ -2485,7 +2654,7 @@ class AdvancedRecorderApp:
 
             def unlock():
                 try:
-                    camera_controls_auto(dev)
+                    self._controls_for(dev).auto()
                 except Exception as exc:
                     log.warning("camera controls back to auto on %s: %s", dev, exc)
             threading.Thread(target=unlock, daemon=True).start()
@@ -2494,6 +2663,15 @@ class AdvancedRecorderApp:
                 os.remove(ACTIVE_RUN_PATH)
         except Exception as exc:
             log.warning("could not remove %s: %s", ACTIVE_RUN_PATH, exc)
+
+    def _check_ffmpeg(self):
+        if shutil.which("ffmpeg"):
+            return
+        where = {"win": "winget install Gyan.FFmpeg", "darwin": "brew install ffmpeg"}
+        hint = next((v for k, v in where.items() if sys.platform.startswith(k)), "sudo apt install ffmpeg")
+        log.error("ffmpeg not found on PATH")
+        self.show_alert(f"FFMPEG NOT FOUND  •  RECORDING{' AND THERMAL' if IS_MAC else ''} WILL NOT WORK  •  "
+                        f"INSTALL IT:  {hint}", "error", 20000)
 
     def _check_resume(self):
         """A capture was running when the app last died: offer to resume it."""
@@ -2575,11 +2753,39 @@ class AdvancedRecorderApp:
             if self.autostart_var.get():
                 os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
                 script = os.path.abspath(__file__)
-                with open(AUTOSTART_PATH, "w") as f:
-                    f.write("[Desktop Entry]\nType=Application\nName=Amin Studio\n"
-                            f"Exec=\"{sys.executable}\" \"{script}\"\n"
-                            f"Path={os.path.dirname(script)}\n"
-                            "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=15\n")
+                if sys.platform.startswith("win"):
+                    exe = sys.executable
+                    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                    if os.path.exists(pyw):
+                        exe = pyw              # no console window
+                    with open(AUTOSTART_PATH, "w") as f:
+                        f.write("@echo off\r\n"
+                                "rem Amin Studio: launch at login (wait for USB devices)\r\n"
+                                "timeout /t 15 /nobreak >nul\r\n"
+                                f"cd /d \"{os.path.dirname(script)}\"\r\n"
+                                f"start \"\" \"{exe}\" \"{script}\"\r\n")
+                elif sys.platform == "darwin":
+                    import plistlib
+                    folder = os.path.dirname(script)
+                    plist = {
+                        "Label": "com.aminstudio.recorder",
+                        # wait for USB devices to enumerate after login
+                        "ProgramArguments": ["/bin/sh", "-c",
+                                             f'sleep 15; exec "{sys.executable}" "{script}"'],
+                        "WorkingDirectory": folder,
+                        "RunAtLoad": True,
+                        "StandardOutPath": os.path.join(CONFIG_DIR, "logs", "launchagent.log"),
+                        "StandardErrorPath": os.path.join(CONFIG_DIR, "logs", "launchagent.log"),
+                    }
+                    os.makedirs(os.path.join(CONFIG_DIR, "logs"), exist_ok=True)
+                    with open(AUTOSTART_PATH, "wb") as f:
+                        plistlib.dump(plist, f)
+                else:
+                    with open(AUTOSTART_PATH, "w") as f:
+                        f.write("[Desktop Entry]\nType=Application\nName=Amin Studio\n"
+                                f"Exec=\"{sys.executable}\" \"{script}\"\n"
+                                f"Path={os.path.dirname(script)}\n"
+                                "X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=15\n")
                 log.info("launch at login enabled (%s)", AUTOSTART_PATH)
                 self.notify("WILL LAUNCH AT LOGIN  •  COMBINE WITH AUTOMATIC LOGIN TO SURVIVE A REBOOT", 5000)
             elif os.path.exists(AUTOSTART_PATH):
@@ -2604,7 +2810,8 @@ class AdvancedRecorderApp:
         hints = {
             "auto": "Camera adjusts exposure, white balance and focus itself.",
             "lock": "At the start of each run the settled values are read and\nfrozen, so every image is taken with the same settings.",
-            "manual": "Your values are applied every time the camera opens.\nREAD fills in what the camera is using now.",
+            "manual": "Your values are applied every time the camera opens.\nREAD fills in what the camera is using now"
+                      + (" (units are the camera's own)." if not IS_LINUX else "."),
         }
         self.ctrl_status_label.configure(text=hints[mode], text_color=COLORS["text_dim"])
         self._sync_ctrl_settings()
@@ -2627,6 +2834,24 @@ class AdvancedRecorderApp:
                 self.show_alert(f"CAMERA {key.upper()} MUST BE A WHOLE NUMBER", "error", 3000)
         self._ctrl_manual = values
 
+    def _controls_for(self, device, cap=None, backend=None, settle_s=0.0):
+        """The way to reach this camera's exposure / WB / focus right now.
+
+        Linux: v4l2-ctl (works even while FFmpeg records). Elsewhere OpenCV
+        properties: on `cap` when the caller is the camera thread, through the
+        camera service when it has the camera open, or by opening it briefly.
+        """
+        if have_v4l2_ctl() and device.startswith("/dev/"):
+            return V4L2Controls(device)
+        if cap is not None:
+            return OpenCVControls(cap, backend)
+        cfg = self.camera.config
+        if self.camera.running and cfg and self._same_device(cfg[0], device):
+            return ServiceControls(self.camera)
+        if self.is_recording and self.ffmpeg_proc is not None:
+            raise RuntimeError("the recorder has the camera; settings are applied when a recording starts")
+        return TemporaryControls(device, settle_s=settle_s)
+
     def read_camera_controls(self):
         dev = self.get_selected_camera_path()
         if not self.camera_is_valid():
@@ -2635,7 +2860,7 @@ class AdvancedRecorderApp:
 
         def worker():
             try:
-                vals = camera_controls_read(dev)
+                vals = self._controls_for(dev).read()
             except Exception as exc:
                 msg = f"CANNOT READ CAMERA CONTROLS  •  {exc}"
                 self.root.after(0, lambda: self.show_alert(msg, "error", 5000))
@@ -2646,39 +2871,43 @@ class AdvancedRecorderApp:
                     var.set(str(vals[key]) if key in vals else "")
                 self._sync_ctrl_settings()
                 missing = [k for k in self.ctrl_vars if k not in vals]
-                txt = "Read from camera: " + ", ".join(f"{k} {v}" for k, v in vals.items())
+                txt = "Read from camera: " + (", ".join(f"{k} {v}" for k, v in vals.items()) or "nothing")
                 if missing:
-                    txt += f"\n(not supported by this camera: {', '.join(missing)})"
+                    txt += f"\n(not available on this camera / OS: {', '.join(missing)})"
                 self.ctrl_status_label.configure(text=txt, text_color=COLORS["cyan"])
             self.root.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _camera_ready_hook(self, device):
-        """Called from a camera worker thread once the camera has warmed up.
+    def _camera_ready_hook(self, device, cap=None, backend=None):
+        """Called from a camera worker thread once the camera has warmed up
+        (with that thread's capture), or from _apply_camera_controls_async.
 
         Raises on failure; the caller logs it and carries on.
         """
         mode = self._ctrl_mode
+        if mode == "auto" and not self._ctrl_touched:
+            return
+        ctl = self._controls_for(device, cap, backend, settle_s=2.5 if mode == "lock" else 0.5)
         if mode == "auto":
-            if self._ctrl_touched:
-                camera_controls_auto(device)
-                self._ctrl_touched = False
+            ctl.auto()
+            self._ctrl_touched = False
             return
         if mode == "manual":
-            applied = camera_controls_manual(device, dict(self._ctrl_manual))
+            applied = ctl.manual(dict(self._ctrl_manual))
             self._ctrl_touched = True
             msg = "Manual: " + (", ".join(f"{k} {v}" for k, v in applied.items()) or "nothing applied")
         else:  # lock
             if self._locked_values is None:
-                self._locked_values = camera_controls_lock(device)
+                self._locked_values = ctl.lock()
                 msg = "Locked at: " + (", ".join(f"{k} {v}" for k, v in self._locked_values.items())
                                        or "nothing (no controls)")
             else:
                 # Camera was re-opened mid-run: re-apply the same frozen values.
-                camera_controls_manual(device, dict(self._locked_values))
+                ctl.manual(dict(self._locked_values))
                 msg = "Re-applied lock: " + ", ".join(f"{k} {v}" for k, v in self._locked_values.items())
             self._ctrl_touched = True
+        log.info("camera controls on %s: %s", device, msg)
         self.root.after(0, lambda: self.ctrl_status_label.configure(text=msg, text_color=COLORS["green"]))
 
     def _apply_camera_controls_async(self, device, fresh=False):
@@ -2695,6 +2924,22 @@ class AdvancedRecorderApp:
                 self.root.after(0, lambda: self.show_alert(msg, "warning", 5000))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_controls_before_ffmpeg(self, device, fresh):
+        """Windows / macOS: FFmpeg cannot set exposure etc., so set them on a
+        short-lived handle just before FFmpeg opens the camera. Blocks briefly
+        (up to ~3 s for "Lock at start", while auto exposure settles)."""
+        if fresh:
+            self._locked_values = None
+        if self._ctrl_mode == "auto" and not self._ctrl_touched:
+            return
+        self.show_alert("APPLYING CAMERA EXPOSURE / WHITE BALANCE…", "info", 4000)
+        self.root.update_idletasks()
+        try:
+            self._camera_ready_hook(device)
+        except Exception as exc:
+            log.warning("camera controls on %s: %s", device, exc)
+            self.show_alert(f"CAMERA CONTROLS  •  {exc}", "warning", 5000)
 
     # ------------------------------------------------------------------
     # Time-lapse (photo tab)
@@ -2807,7 +3052,8 @@ class AdvancedRecorderApp:
             raise ValueError("enable the camera, the thermal camera, or both")
         if s.use_camera and not self.camera_is_valid():
             raise ValueError("no valid camera selected")
-        if s.use_camera and s.use_thermal and self.get_selected_camera_path() == self.get_selected_thermal_path():
+        if s.use_camera and s.use_thermal and self._same_device(
+                self.get_selected_camera_path(), self.get_selected_thermal_path()):
             raise ValueError("camera and thermal camera are the same device")
         if s.use_thermal and not s.thermal_image and s.thermal_data == "none":
             raise ValueError("thermal is enabled but no thermal output is selected")
@@ -2820,7 +3066,7 @@ class AdvancedRecorderApp:
 
     def _acquire_photo_devices(self, user, s, keep_camera=True):
         if s.use_thermal:
-            self.thermal.acquire(user, self.get_selected_thermal_path())
+            self.thermal.acquire(user, self.get_selected_thermal_path(), avoid=self._thermal_avoid())
         if s.use_camera and keep_camera:
             w, h = self._photo_resolution()
             self.camera.acquire(user, self.get_selected_camera_path(), w, h)
@@ -3024,9 +3270,9 @@ class AdvancedRecorderApp:
     def toggle_image_preview(self):
         if self.is_image_previewing:
             self.is_image_previewing = False
-            self.snap_btn.configure(text="IMAGE PREVIEW")
-            self.preview_mode_label.configure(text="OFFLINE", text_color=COLORS["text_dim"])
-            self.thermal.release("preview")
+            self._burst_gen += 1
+            self.thermal.release("image-preview")
+            self._reset_image_preview_ui()
             return
 
         if self.is_streaming:
@@ -3041,7 +3287,14 @@ class AdvancedRecorderApp:
             self.show_alert("RATE AND DURATION MUST BE POSITIVE NUMBERS", "error", 5000)
             return
 
+        cam_path = self.get_selected_camera_path() if self.use_camera_var.get() else None
+        if (self.use_camera_var.get() and self.use_thermal_var.get()
+                and self._same_device(cam_path, self.get_selected_thermal_path())):
+            self.show_alert("CAMERA AND THERMAL CAMERA ARE THE SAME DEVICE  •  PICK ANOTHER CAMERA", "error", 6000)
+            return
+
         self.is_image_previewing = True
+        self._burst_gen += 1
         self.snap_btn.configure(
             text="STOP IMAGE PREVIEW",
             fg_color=COLORS["red"],
@@ -3049,15 +3302,17 @@ class AdvancedRecorderApp:
         )
         self.preview_mode_label.configure(text="BURST PREVIEW", text_color=COLORS["cyan"])
         if self.use_thermal_var.get():
-            self.thermal.acquire("preview", self.get_selected_thermal_path())
+            self.thermal.acquire("image-preview", self.get_selected_thermal_path(),
+                                 avoid=self._thermal_avoid())
 
         self.image_preview_thread = threading.Thread(
             target=self._image_preview_worker,
+            args=(self._burst_gen,),
             daemon=True,
         )
         self.image_preview_thread.start()
 
-    def _image_preview_worker(self):
+    def _image_preview_worker(self, gen):
         try:
             rate_ipm = int(float(self.snap_rate_var.get()))
             duration_sec = int(float(self.snap_duration_var.get()))
@@ -3081,7 +3336,10 @@ class AdvancedRecorderApp:
                 self.camera.acquire(camera_user, camera, width, height)
                 camera_acquired = True
 
-        while self.is_image_previewing:
+        def active():
+            return self.is_image_previewing and gen == self._burst_gen
+
+        while active():
             current_time = time.time()
             if current_time - start_time > duration_sec:
                 break
@@ -3090,14 +3348,14 @@ class AdvancedRecorderApp:
                 if use_cam and self.is_recording:
                     if os.path.exists(self.shm_snapshot):
                         try:
-                            frame = cv2.imread(self.shm_snapshot)
+                            frame = imread(self.shm_snapshot)
                             if frame is not None:
                                 self.root.after(0, self.render_frame_to_preview, frame)
                         except Exception:
                             pass
                 elif use_cam:
                     frame = self.camera.snapshot(timeout=10.0)
-                    if frame is not None:
+                    if frame is not None and active():
                         self.root.after(0, self.render_frame_to_preview, frame)
                 self._burst_thermal_due = True
                 last_frame_time = current_time
@@ -3107,17 +3365,25 @@ class AdvancedRecorderApp:
         if camera_acquired:
             self.camera.release(camera_user)
 
-        self.is_image_previewing = False
-        self.root.after(0, self._reset_image_preview_ui)
+        # Only the burst that is still current may end the preview: a stopped
+        # one must not touch a burst or live stream started after it.
+        def finished():
+            if gen != self._burst_gen or not self.is_image_previewing:
+                return
+            self.is_image_previewing = False
+            self._burst_gen += 1
+            self.thermal.release("image-preview")
+            self._reset_image_preview_ui()
+        self.root.after(0, finished)
 
     def _reset_image_preview_ui(self):
-        self.thermal.release("preview")
         self.snap_btn.configure(
             text="IMAGE PREVIEW" if self.mode == "video" else "SHOW LAST CAPTURE",
             fg_color=COLORS["panel_alt"],
             hover_color=COLORS["border"],
         )
-        self.preview_mode_label.configure(text="OFFLINE", text_color=COLORS["text_dim"])
+        if not self.is_streaming:
+            self.preview_mode_label.configure(text="OFFLINE", text_color=COLORS["text_dim"])
 
     # ------------------------------------------------------------------
     # Live stream (both tabs)
@@ -3125,6 +3391,7 @@ class AdvancedRecorderApp:
     def toggle_live_stream(self):
         if self.is_streaming:
             self.is_streaming = False
+            self._stream_gen += 1
             self.stream_btn.configure(
                 text="LIVE STREAM",
                 fg_color=COLORS["cyan_dark"],
@@ -3141,9 +3408,6 @@ class AdvancedRecorderApp:
                 self.thermal_pane_title.configure(text="THERMAL")
             return
 
-        if self.is_image_previewing:
-            self.toggle_image_preview()
-
         use_cam = self.use_camera_var.get()
         use_th = self.use_thermal_var.get()
         if not use_cam and not use_th:
@@ -3154,8 +3418,15 @@ class AdvancedRecorderApp:
             use_cam = False
             if not use_th:
                 return
+        if use_cam and use_th and not self.is_recording and self._same_device(
+                self.get_selected_camera_path(), self.get_selected_thermal_path()):
+            # Both services would fight over one device; the thermal one loses.
+            self.show_alert("CAMERA AND THERMAL CAMERA ARE THE SAME DEVICE  •  "
+                            "PICK THE OTHER CAMERA IN THE CAMERA LIST", "error", 7000)
+            use_cam = False
 
         self.is_streaming = True
+        self._stream_gen += 1
         self.stream_btn.configure(
             text="STOP STREAM",
             fg_color=COLORS["red"],
@@ -3164,26 +3435,56 @@ class AdvancedRecorderApp:
         self.preview_mode_label.configure(text="LIVE", text_color=COLORS["green"])
 
         if use_th:
-            self.thermal.acquire("preview", self.get_selected_thermal_path())
-            self.thermal_display.configure(text="OPENING THERMAL CAMERA…")
+            self.thermal.acquire("preview", self.get_selected_thermal_path(),
+                                 avoid=self._thermal_avoid())
+            if self.thermal.status != "ONLINE":
+                self.thermal_display.configure(text="OPENING THERMAL CAMERA…")
+        # Stop a running burst only now, so the thermal camera (held by the
+        # stream already) stays open instead of being closed and re-opened.
+        if self.is_image_previewing:
+            self.toggle_image_preview()
         if use_cam:
             if self.is_recording:
-                self.stream_thread = threading.Thread(target=self._stream_worker_recording, daemon=True)
+                self.stream_thread = threading.Thread(target=self._stream_worker_recording,
+                                                      args=(self._stream_gen,), daemon=True)
                 self.stream_thread.start()
             else:
-                if self.mode == "photo":
-                    w, h = self._photo_resolution()
-                else:
-                    w, h = map(int, self.res_var.get().split()[0].split("x"))
-                self.camera.acquire("preview", self.get_selected_camera_path(), w, h)
+                self._acquire_preview_camera()
                 self.preview_display.configure(text="OPENING CAMERA…")
-                self._camera_preview_loop()
+                self._camera_preview_loop(self._stream_gen)
 
-    def _stream_worker_recording(self):
-        while self.is_streaming and self.is_recording:
+    def _preview_resolution(self):
+        if self.mode == "photo":
+            return self._photo_resolution()
+        return tuple(map(int, self.res_var.get().split()[0].split("x")))
+
+    def _acquire_preview_camera(self):
+        w, h = self._preview_resolution()
+        self.camera.acquire("preview", self.get_selected_camera_path(), w, h)
+
+    @staticmethod
+    def _same_device(cam_path, thermal_path):
+        """True when the camera and the thermal camera are one device."""
+        if not cam_path or not thermal_path:
+            return False
+        if cam_path == thermal_path:
+            return True
+        a, b = device_index(cam_path), device_index(thermal_path)
+        return a is not None and a == b
+
+    def _thermal_avoid(self):
+        """Indices the thermal auto-detect scan must not probe: the ordinary
+        camera, which is (or is about to be) open at the same time."""
+        if not self.use_camera_var.get() or not self.camera_is_valid():
+            return ()
+        idx = device_index(self.get_selected_camera_path())
+        return () if idx is None else (idx,)
+
+    def _stream_worker_recording(self, gen):
+        while self.is_streaming and self.is_recording and gen == self._stream_gen:
             if os.path.exists(self.shm_snapshot):
                 try:
-                    frame = cv2.imread(self.shm_snapshot)
+                    frame = imread(self.shm_snapshot)
                     if frame is not None:
                         self.root.after(0, self.render_frame_to_preview, frame)
                 except Exception:
@@ -3191,15 +3492,17 @@ class AdvancedRecorderApp:
             time.sleep(0.5)
         self.root.after(0, self._reset_stream_ui)
 
-    def _camera_preview_loop(self):
-        if not self.is_streaming or self.is_recording:
+    def _camera_preview_loop(self, gen):
+        # One loop per stream: a stop/start (or a device change) bumps the
+        # generation, so an older loop ends instead of running alongside.
+        if not self.is_streaming or self.is_recording or gen != self._stream_gen:
             return
         frame, _ts = self.camera.preview_frame()
         if frame is not None:
             self.render_frame_to_preview(frame)
         elif self.camera.status == "ERROR":
             self.preview_display.configure(image="", text=f"CAMERA ERROR\n{self.camera.error[:60]}")
-        self.root.after(120, self._camera_preview_loop)
+        self.root.after(120, self._camera_preview_loop, gen)
 
     def _reset_stream_ui(self):
         if not self.is_streaming:
@@ -3538,6 +3841,14 @@ class AdvancedRecorderApp:
                 self.pipeline.calib = Calibration.load(CALIB_PATH)
         except Exception:
             pass
+        try:
+            # backend/strategy that opened the thermal camera last time: tried
+            # first, so start-up skips the full search (falls back to it if stale)
+            for key, (idx, backend, strategy, swap) in (self._settings.get("thermal_known") or {}).items():
+                self.thermal._known[key] = (int(idx), int(backend), str(strategy))
+                self.thermal._known_swap[key] = None if swap is None else bool(swap)
+        except Exception:
+            pass
 
     def _apply_loaded_settings(self):
         ui = self._settings.get("ui", {})
@@ -3558,6 +3869,8 @@ class AdvancedRecorderApp:
                     var.set(ui[key])
                 except Exception:
                     pass
+        if self.codec_var.get() not in CODEC_CHOICES:
+            self.codec_var.set(CODEC_CHOICES[0])
         for key, var in {"use_camera": self.use_camera_var, "use_thermal": self.use_thermal_var,
                          "overlay": self.thermal_overlay_var, "day_folders": self.day_folders_var,
                          "thermal_image": self.thermal_image_var, "thermal_bar": self.thermal_bar_var,
@@ -3598,7 +3911,9 @@ class AdvancedRecorderApp:
             "cam_ctrl_values": {k: v.get() for k, v in self.ctrl_vars.items()},
             "resume": self.resume_var.get(), "corrected_copy": self.corrected_copy_var.get(),
         }
-        data = {"ui": ui, "thermal": self.pipeline.to_dict()}
+        known = {key: [*cfg, self.thermal._known_swap.get(key)]
+                 for key, cfg in self.thermal._known.items() if cfg}
+        data = {"ui": ui, "thermal": self.pipeline.to_dict(), "thermal_known": known}
         tmp = SETTINGS_PATH + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
@@ -3630,6 +3945,8 @@ class AdvancedRecorderApp:
             except Exception:
                 pass
         if event.state & 0x4:                      # Ctrl held: leave to the toolkit
+            return
+        if event.state & 0x8:                      # Command (macOS) / Alt (Linux): system shortcuts
             return
 
         char = event.char
@@ -3782,7 +4099,7 @@ class AdvancedRecorderApp:
 
         head = ctk.CTkFrame(card, fg_color="transparent")
         head.pack(fill="x", padx=18, pady=(14, 4))
-        ctk.CTkLabel(head, text="KEYBOARD SHORTCUTS", font=("Segoe UI", 16, "bold"),
+        ctk.CTkLabel(head, text="KEYBOARD SHORTCUTS", font=(UI_FAMILY, 16, "bold"),
                      text_color=COLORS["text"]).pack(side="left")
         ctk.CTkLabel(head, text="H / ESC TO CLOSE", font=FONT_MONO_SMALL,
                      text_color=COLORS["cyan"]).pack(side="right")
@@ -3799,7 +4116,7 @@ class AdvancedRecorderApp:
                 r += 1
                 for keys, desc in rows:
                     ctk.CTkLabel(
-                        column, text=keys, font=("DejaVu Sans Mono", 10, "bold"),
+                        column, text=keys, font=(MONO_FAMILY, 10, "bold"),
                         text_color=COLORS["cyan"], fg_color=COLORS["panel_alt"], corner_radius=5,
                         width=120, anchor="center",
                     ).grid(row=r, column=0, sticky="w", pady=2)
@@ -3862,6 +4179,8 @@ class AdvancedRecorderApp:
             self._end_capture_session()
             self.is_streaming = False
             self.is_image_previewing = False
+            self._stream_gen += 1
+            self._burst_gen += 1
             self.thermal.shutdown()
             self.camera.shutdown()
             log.info("===== Amin Studio closed =====")

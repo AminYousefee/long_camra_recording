@@ -2,7 +2,7 @@
 
 A cross-platform desktop application for long-duration camera recording and monitoring. The program provides a modern CustomTkinter GUI for selecting a camera, configuring resolution/FPS/codec/quality, recording segmented video files with FFmpeg, previewing the camera, estimating storage requirements, monitoring remaining recording capacity, and optionally displaying CPU/RAM telemetry.
 
-Camera capture also has native backend paths for Windows (DirectShow/Media Foundation) and macOS (AVFoundation), so standard USB webcams do not need to be from a specific brand. Install FFmpeg with the matching input backend enabled and allow the app to access the camera in the operating system's privacy settings. Manual exposure, white-balance, and focus controls are Linux/V4L2-only. The setup guide below remains Ubuntu-focused.
+It runs on **Linux, Windows and macOS** with the same features on each (see *Platform support* below). Camera capture uses each system's native path — V4L2 on Linux, DirectShow / Media Foundation on Windows, AVFoundation on macOS — so standard USB webcams work whatever their brand. Install FFmpeg and allow the app to access the camera in the operating system's privacy settings. The detailed setup guide further down is Ubuntu-focused; Windows and macOS setup is in *Platform support*.
 
 It now also drives a **TOPDON TC001 / TS001 thermal camera** next to the normal camera, and has two tabs:
 
@@ -91,7 +91,7 @@ capture_log.csv    one row per shot: time with UTC offset, files, thermal min/ma
 
 ### Camera exposure, white balance and focus
 
-*Exposure/WB* in the Devices card (needs `v4l2-ctl` from `v4l-utils`):
+*Exposure/WB* in the Devices card. Linux uses `v4l2-ctl` (from `v4l-utils`) when it is installed, and OpenCV's camera properties otherwise; Windows and macOS use OpenCV's camera properties. Which controls exist depends on the camera (and on macOS, see *Platform support*). Values are in the camera's own units — on Windows exposure is a log2 of seconds (−6 = 1/64 s) — so press **READ** to see what yours uses.
 
 - **Auto**: the camera decides everything (as before).
 - **Lock at start**: auto-exposure, auto white balance and autofocus settle, then their values are frozen for the whole recording or time-lapse, so brightness changes in the images come from the scene, not the camera. The locked values are shown in the card and in the log.
@@ -99,13 +99,42 @@ capture_log.csv    one row per shot: time with UTC offset, files, thermal min/ma
 
 With *Lock at start*, the controls go back to auto when the capture stops. *Manual* values stay set on the camera until you switch to Auto.
 
+On Windows and macOS, FFmpeg opens the camera itself for recording and cannot set these controls, so the app sets them on the camera just before FFmpeg opens it ("APPLYING CAMERA EXPOSURE…", up to ~3 s for *Lock at start*). UVC cameras keep the values while they stay powered. Changing the mode *during* a recording takes effect at the next recording (on Linux it applies at once).
+
+### Platform support
+
+| Feature | Linux | Windows | macOS |
+|---|---|---|---|
+| Camera preview, photos, time-lapse | V4L2 | DirectShow (Media Foundation fallback) | AVFoundation |
+| Camera recording (FFmpeg) | `v4l2`, MJPEG | `dshow`, MJPEG at the chosen size (falls back to the default mode) | `avfoundation` |
+| GPU encoder | `h264_vaapi` | `h264_qsv` (Intel) | `h264_videotoolbox` |
+| Thermal camera (raw temperatures) | OpenCV V4L2, FFmpeg fallback | Media Foundation, FFmpeg fallback | FFmpeg (OpenCV's macOS backend cannot give raw frames) |
+| Exposure / WB / focus | `v4l2-ctl` or OpenCV | OpenCV (DirectShow) | OpenCV — most Mac camera drivers expose none of these, so READ may show nothing |
+| Keep awake while capturing | `systemd-inhibit` | `SetThreadExecutionState` | `caffeinate` |
+| Launch at login | `~/.config/autostart` | Startup folder `.cmd` | `~/Library/LaunchAgents` |
+| CPU / RAM telemetry | `/proc` or `psutil` | `psutil` or Windows API | `psutil` (load average without it) |
+
+**Windows setup**
+
+1. Install Python 3.11+ from python.org and FFmpeg (`winget install Gyan.FFmpeg`, then open a new terminal so `ffmpeg` is on PATH).
+2. `pip install -r requirements_cyber_video_logger.txt` (includes `pygrabber`, which lists cameras by name in the order OpenCV uses).
+3. *Settings → Privacy & security → Camera*: allow desktop apps.
+4. Uninstall any TOPDON PC software — its driver blocks raw capture.
+5. Run `python amin_studio.py` (or `pythonw amin_studio.py` without a console).
+
+**macOS setup**
+
+1. `brew install python-tk ffmpeg`, then `pip3 install -r requirements_cyber_video_logger.txt`.
+2. The first time, macOS asks for camera access for the app that runs Python (Terminal, iTerm, VS Code…). Allow it; if you missed the prompt: *System Settings → Privacy & Security → Camera*.
+3. Run `python3 amin_studio.py`. Right-click (or Ctrl-click) removes a thermal reference point.
+
 ### Unattended runs: log, sleep, crash and reboot
 
 - **Log**: everything that happens goes to `<save path>/logs/studio.log`, a new file every midnight: starts/stops, locked exposure values, every thermal-setting change, camera dropouts and reconnects, encoder restarts, skipped or failed shots, low-disk stops, and every warning shown on screen. FFmpeg's own messages go to `logs/ffmpeg_camera.log` and `logs/ffmpeg_thermal_*.log`. Before a capture starts, the log is in `~/.config/amin_studio/logs/`.
-- **No sleep**: while capturing, the app blocks suspend, idle-sleep and lid-close sleep (via `systemd-inhibit`). To be safe, also turn off *Automatic Suspend* in Ubuntu's power settings.
+- **No sleep**: while capturing, the app blocks suspend, idle-sleep and lid-close sleep (via `systemd-inhibit` on Linux, `SetThreadExecutionState` on Windows, `caffeinate` on macOS). To be safe, also turn off automatic sleep in the system's power settings.
 - **Crash recovery**: if the camera FFmpeg dies, only it is restarted. The thermal recording continues uninterrupted.
 - **Resume**: with *Resume unfinished capture on launch* ticked (default), a capture that ended because the app crashed or the machine rebooted restarts automatically 20 s after the app opens (ESC cancels). If the camera isn't there yet (e.g. just after a reboot) it rescans and waits up to about a minute. The log records when the interrupted run started and when it resumed, so the gap is visible. A capture you stop yourself, or end by closing the window, is not resumed.
-- **Launch at login**: starts the app automatically when you log in. Combined with automatic login in Ubuntu's user settings, a time-lapse survives a power cut or reboot with no one at the machine.
+- **Launch at login**: starts the app automatically when you log in (Linux: `~/.config/autostart`; Windows: a `.cmd` in the Startup folder). Combined with automatic login in Ubuntu's user settings, a time-lapse survives a power cut or reboot with no one at the machine.
 
 The thermal camera stays on during a time-lapse (it needs a few minutes of warm-up to be accurate). The normal camera stays open when shots are ≤ 15 min apart; for sparser schedules it is opened ~1.5 s before each shot so it doesn't run all day.
 
@@ -125,6 +154,8 @@ The thermal camera stays on during a time-lapse (it needs a few minutes of warm-
 Shortcuts are ignored while typing in a field; ESC leaves the field.
 
 ### Thermal camera notes
+- On Windows the TC001 usually shows up only as **"USB Camera"**. The device scan opens such cameras briefly and recognises the thermal one by its 256-px-wide frame, so it is labelled `| THERMAL` and never picked as the normal camera. If the normal camera is ever pointed at it anyway, the app switches the normal camera to the other device.
+- The first time, finding the right capture mode takes a few seconds (DirectShow converts this camera's stream, so the app falls through to Media Foundation). The mode that worked is saved in `settings.json`, so later starts open the thermal camera in one attempt.
 - Uninstall any TOPDON PC software on machines where it exists; its driver blocks raw capture.
 - Your user must be in the `video` group (see below).
 - Accuracy is the sensor's (±2 °C or ±2 %) after warm-up; use reference points for better.
@@ -163,7 +194,7 @@ This guide explains how to set up the project from a fresh **Ubuntu** machine by
 
 ## Operating system
 
-The application is designed for Linux and is intended to run on distributions such as:
+The application runs on Linux, Windows and macOS (see *Platform support* above). This guide covers Linux, where it is intended to run on distributions such as:
 
 - Ubuntu 22.04 LTS
 - Ubuntu 24.04 LTS
@@ -535,7 +566,11 @@ It can produce smaller files at comparable visual quality but requires significa
 
 Hardware-accelerated H.264 using VAAPI.
 
-This requires compatible graphics hardware and Linux VAAPI support. See the VAAPI section below.
+This requires compatible graphics hardware and Linux VAAPI support. See the VAAPI section below. Linux only.
+
+### `h264_qsv` (Windows) / `h264_videotoolbox` (macOS)
+
+The GPU encoder offered on Windows (Intel Quick Sync) and macOS (VideoToolbox) instead of VAAPI. Quick Sync uses the CRF value as its quality setting; VideoToolbox has no CRF, so it records at the bitrate the storage estimate assumes. If the GPU encoder is not available, FFmpeg exits and `logs/ffmpeg_camera.log` says why; choose `libx264`.
 
 ---
 

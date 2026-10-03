@@ -25,7 +25,9 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from thermalcam import Calibration, TemperatureSpan, ThermalCamera, ThermalCameraError
+from platform_utils import imwrite, no_window_kwargs
+from thermalcam import Calibration, TemperatureSpan, ThermalCamera
+from thermalcam.camera import OpenCancelled
 from thermalcam.decode import SENSOR_HEIGHT, SENSOR_WIDTH, celsius_to_raw
 from thermalcam.render import COLORMAP_NAMES, colorbar, colorize_celsius, draw_marker, label
 
@@ -331,9 +333,19 @@ class ThermalService:
     Consumers call acquire(name) / release(name); the camera runs while anybody
     holds it. The latest frame is kept in memory (it is small: 256x192) and
     consumers read it or wait for fresh ones. Unplugs are retried.
+
+    acquire() and release() never block the caller (the GUI thread): stopping
+    only signals the worker. A worker started afterwards first waits for its
+    predecessor to let go of the device, and a stopped worker can no longer
+    change the service state, so a slow open that finishes late cannot
+    overwrite a newer one.
     """
 
     LOG_NAME = "thermal camera"
+    #: consecutive failed reads tolerated before the camera is re-opened
+    READ_FAILURES_BEFORE_RECONNECT = 8
+    #: ...or after reads have been failing for this long
+    READ_FAILURE_WINDOW_S = 2.0
 
     def __init__(self, pipeline: ThermalPipeline) -> None:
         self._status = None
@@ -341,8 +353,10 @@ class ThermalService:
         self.pipeline = pipeline
         self.cond = threading.Condition()
         self.users: set[str] = set()
-        self.device: Optional[str] = None       # '/dev/videoN' or None = auto scan
+        self.device: Optional[str] = None       # '/dev/videoN', 'N' (Windows) or None = auto scan
+        self.avoid: set[int] = set()            # indices never probed by the auto scan
         self.thread: Optional[threading.Thread] = None
+        self._retiring: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self.status = "OFF"
         self.error = ""
@@ -351,6 +365,11 @@ class ThermalService:
         self.latest_ts = 0.0
         self.fps = 0.0
         self.info: dict = {}
+        #: index of the camera currently open (None when closed)
+        self.found_index: Optional[int] = None
+        #: (index, backend, strategy) that worked, per requested device -> fast re-open
+        self._known: dict = {}
+        self._known_swap: dict = {}
 
     # --- lifecycle --------------------------------------------------------------
     @property
@@ -370,17 +389,33 @@ class ThermalService:
                         value, f"  ({self.error})" if value in ("ERROR", "RECONNECTING") and self.error else "")
         self._status = value
 
-    def acquire(self, user: str, device: Optional[str]) -> None:
+    def _same_device(self, device: Optional[str]) -> bool:
+        """Would `device` be served by the camera that is running now?"""
+        if device == self.device or device is None:
+            return True
+        idx = device_index(device)
+        return idx is not None and idx == self.found_index
+
+    def acquire(self, user: str, device: Optional[str], avoid=()) -> None:
+        """Start (or join) the thermal camera. Never blocks.
+
+        avoid: camera indices the auto-detect scan must not touch (the
+        ordinary camera, which may be open at the same time).
+        """
         with self.cond:
             self.users.add(user)
-            if self.running and device != self.device:
+            self.avoid = {i for i in avoid if i is not None}
+            if self.running and not self._same_device(device):
                 # Different device asked for: restart on the new one.
                 self._stop_locked()
             if not self.running:
                 self.device = device
                 self._stop = threading.Event()
+                self.error = ""
                 self.status = "OPENING"
-                self.thread = threading.Thread(target=self._worker, args=(self._stop,), daemon=True)
+                self.thread = threading.Thread(target=self._worker,
+                                               args=(self._stop, self._retiring),
+                                               name="thermal-camera", daemon=True)
                 self.thread.start()
 
     def release(self, user: str) -> None:
@@ -389,49 +424,100 @@ class ThermalService:
             if not self.users:
                 self._stop_locked()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 4.0) -> None:
+        """Stop and wait (briefly) for the device to be closed. For app exit."""
         with self.cond:
             self.users.clear()
             self._stop_locked()
+            thread = self._retiring
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+    def wait_closed(self, timeout: float = 5.0) -> bool:
+        thread = self._retiring
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+            return not thread.is_alive()
+        return True
 
     def _stop_locked(self) -> None:
+        """Signal the worker to stop. Non-blocking; caller holds self.cond."""
         self._stop.set()
         self.cond.notify_all()
-        thread = self.thread
+        if self.thread is not None:
+            self._retiring = self.thread
         self.thread = None
-        if thread is not None and thread is not threading.current_thread():
-            self.cond.release()
-            try:
-                thread.join(timeout=4)
-            finally:
-                self.cond.acquire()
         self.status = "OFF"
         self.latest_raw_c = None
         self.fps = 0.0
+        self.found_index = None
 
     # --- worker -----------------------------------------------------------------------
-    def _worker(self, stop: threading.Event) -> None:
+    def _publish(self, stop: threading.Event, **state) -> bool:
+        """Set service state, unless this worker has been stopped meanwhile."""
+        with self.cond:
+            if stop.is_set():
+                return False
+            status = state.pop("status", None)
+            for key, value in state.items():
+                setattr(self, key, value)
+            if status is not None:
+                self.status = status
+            return True
+
+    def _worker(self, stop: threading.Event, predecessor: Optional[threading.Thread]) -> None:
+        # The previous worker may still be closing the device (or finishing a
+        # slow open). Opening while it holds the device fails on Windows.
+        if predecessor is not None:
+            deadline = time.time() + 20.0
+            while predecessor.is_alive() and not stop.is_set() and time.time() < deadline:
+                predecessor.join(timeout=0.2)
         cam = None
+        failures = 0
+        first_failure = 0.0
         while not stop.is_set():
             if cam is None:
+                key = self.device or "auto"
                 try:
                     idx = device_index(self.device) if self.device else None
-                    cam = ThermalCamera(index=idx).open()
-                    self.info = cam.info()
-                    self.status = "ONLINE"
-                    self.error = ""
-                except (ThermalCameraError, Exception) as exc:
+                    cam = ThermalCamera(index=idx, exclude=self.avoid,
+                                        preferred=self._known.get(key),
+                                        swap_bytes=self._known_swap.get(key),
+                                        should_stop=stop.is_set).open()
+                    self._known[key] = cam.resolved
+                    self._known_swap[key] = cam.swap_bytes
+                    if not self._publish(stop, info=cam.info(), error="",
+                                         found_index=cam.resolved[0], status="ONLINE"):
+                        break
+                    failures = 0
+                except OpenCancelled:
                     cam = None
-                    self.error = str(exc).splitlines()[0] if str(exc) else repr(exc)
-                    self.status = "ERROR"
+                    break
+                except Exception as exc:
+                    cam = None
+                    # a stale preference must not stick: next try does a full search
+                    self._known.pop(key, None)
+                    self._known_swap.pop(key, None)
+                    err = str(exc).splitlines()[0] if str(exc) else repr(exc)
+                    self._publish(stop, error=err, status="ERROR")
                     stop.wait(3.0)
                     continue
 
             try:
                 frame = cam.read()
             except Exception as exc:
-                self.error = str(exc).splitlines()[0] if str(exc) else repr(exc)
-                self.status = "RECONNECTING"
+                # A single failed read is not a lost camera (MSMF in particular
+                # drops the odd frame); only give up on a run of failures.
+                now = time.time()
+                if failures == 0:
+                    first_failure = now
+                failures += 1
+                if (failures < self.READ_FAILURES_BEFORE_RECONNECT
+                        and now - first_failure < self.READ_FAILURE_WINDOW_S):
+                    stop.wait(0.05)
+                    continue
+                err = str(exc).splitlines()[0] if str(exc) else repr(exc)
+                self._publish(stop, error=err, found_index=None, status="RECONNECTING")
                 try:
                     cam.close()
                 except Exception:
@@ -439,6 +525,7 @@ class ThermalService:
                 cam = None
                 stop.wait(2.0)
                 continue
+            failures = 0
 
             raw_c = frame.celsius
             self.pipeline.observe(raw_c)
@@ -446,6 +533,9 @@ class ThermalService:
             with self.cond:
                 if stop.is_set():
                     break
+                if self.status != "ONLINE":
+                    self.error = ""
+                    self.status = "ONLINE"
                 if self.latest_ts:
                     dt = now - self.latest_ts
                     if dt > 0:
@@ -494,6 +584,14 @@ class ThermalService:
 # =============================================================================
 # Normal (visible) camera owner, used for live preview and photos
 # =============================================================================
+class CameraIsThermalError(RuntimeError):
+    """The device picked as the normal camera is the thermal camera."""
+
+    def __init__(self, index: Optional[int]) -> None:
+        super().__init__("this is the thermal camera (256 px wide) -- pick the other camera")
+        self.index = index
+
+
 class CameraService:
     """Owns a V4L2 camera via OpenCV from one worker thread.
 
@@ -516,15 +614,20 @@ class CameraService:
         self.users: set[str] = set()
         self.config: Optional[tuple[str, int, int]] = None
         self.thread: Optional[threading.Thread] = None
+        self._retiring: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self.status = "OFF"
         self.error = ""
         self.opened_at = 0.0
         self.latest: Optional[np.ndarray] = None
         self.latest_ts = 0.0
+        #: set when the chosen device turned out to be the thermal camera
+        self.thermal_index: Optional[int] = None
         self._decode_requests = 0
         self.preview_hz = 8.0
         self.actual_size = (0, 0)
+        self.backend: Optional[int] = None
+        self._jobs: list = []           # callables run on the camera thread (controls)
 
     @property
     def running(self) -> bool:
@@ -544,6 +647,7 @@ class CameraService:
         self._status = value
 
     def acquire(self, user: str, device: str, width: int, height: int) -> None:
+        """Start (or join) the camera. Never blocks (see ThermalService)."""
         cfg = (device, int(width), int(height))
         with self.cond:
             self.users.add(user)
@@ -552,8 +656,11 @@ class CameraService:
             if not self.running:
                 self.config = cfg
                 self._stop = threading.Event()
+                self.error = ""
                 self.status = "OPENING"
-                self.thread = threading.Thread(target=self._worker, args=(self._stop,), daemon=True)
+                self.thread = threading.Thread(target=self._worker,
+                                               args=(self._stop, self._retiring),
+                                               name="camera", daemon=True)
                 self.thread.start()
 
     def release(self, user: str) -> None:
@@ -562,22 +669,28 @@ class CameraService:
             if not self.users:
                 self._stop_locked()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 4.0) -> None:
         with self.cond:
             self.users.clear()
             self._stop_locked()
+        self.wait_closed(timeout)
+
+    def wait_closed(self, timeout: float = 5.0) -> bool:
+        """Block until a stopped worker has released the device (e.g. before
+        FFmpeg opens the same camera)."""
+        thread = self._retiring
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+            return not thread.is_alive()
+        return True
 
     def _stop_locked(self) -> None:
+        """Signal the worker to stop. Non-blocking; caller holds self.cond."""
         self._stop.set()
         self.cond.notify_all()
-        thread = self.thread
+        if self.thread is not None:
+            self._retiring = self.thread
         self.thread = None
-        if thread is not None and thread is not threading.current_thread():
-            self.cond.release()
-            try:
-                thread.join(timeout=4)
-            finally:
-                self.cond.acquire()
         self.status = "OFF"
         self.latest = None
 
@@ -595,15 +708,18 @@ class CameraService:
                 candidate = cv2.VideoCapture(index, backend)
                 if candidate.isOpened():
                     cap = candidate
+                    self.backend = backend
                     break
                 candidate.release()
             if cap is None:
                 raise RuntimeError(f"could not open {device}")
         else:
             cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+            self.backend = cv2.CAP_V4L2
             if not cap.isOpened():
                 cap.release()
                 cap = cv2.VideoCapture(device)
+                self.backend = cv2.CAP_ANY
         if not cap.isOpened():
             raise RuntimeError(f"could not open {device}")
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -615,34 +731,59 @@ class CameraService:
             pass
         self.actual_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        if self.actual_size[0] == SENSOR_WIDTH:
+            # Only the TC001 streams 256 px wide. Holding it here would lock the
+            # thermal pipeline out of its own camera.
+            cap.release()
+            raise CameraIsThermalError(device_index(device))
         return cap
 
-    def _worker(self, stop: threading.Event) -> None:
+    def _publish(self, stop: threading.Event, **state) -> bool:
+        with self.cond:
+            if stop.is_set():
+                return False
+            status = state.pop("status", None)
+            for key, value in state.items():
+                setattr(self, key, value)
+            if status is not None:
+                self.status = status
+            return True
+
+    def _worker(self, stop: threading.Event, predecessor: Optional[threading.Thread] = None) -> None:
+        if predecessor is not None:
+            deadline = time.time() + 20.0
+            while predecessor.is_alive() and not stop.is_set() and time.time() < deadline:
+                predecessor.join(timeout=0.2)
         cap = None
         failures = 0
         last_preview = 0.0
+        hook_done = False
         while not stop.is_set():
             if cap is None:
                 try:
                     cap = self._open()
-                    self.opened_at = time.time()
-                    self.ready_at = float("inf")
+                    if stop.is_set():
+                        break
                     hook_done = False
-                    self.error = ""
-                    self.status = "ONLINE"
                     failures = 0
+                    if not self._publish(stop, opened_at=time.time(), ready_at=float("inf"),
+                                         error="", status="ONLINE"):
+                        break
+                except CameraIsThermalError as exc:
+                    # Do not retry: every retry would snatch the device from
+                    # the thermal service again.
+                    self._publish(stop, error=str(exc), thermal_index=exc.index, status="ERROR")
+                    break
                 except Exception as exc:
                     cap = None
-                    self.error = str(exc)
-                    self.status = "ERROR"
+                    self._publish(stop, error=str(exc), status="ERROR")
                     stop.wait(3.0)
                     continue
 
             if not cap.grab():
                 failures += 1
                 if failures > 20:
-                    self.error = "grab() keeps failing"
-                    self.status = "RECONNECTING"
+                    self._publish(stop, error="grab() keeps failing", status="RECONNECTING")
                     cap.release()
                     cap = None
                     stop.wait(2.0)
@@ -656,7 +797,7 @@ class CameraService:
                 hook_done = True
                 if self.on_ready is not None:
                     try:
-                        self.on_ready(self.config[0])
+                        self.on_ready(self.config[0], cap, self.backend)
                         settle = 0.8        # new exposure takes a few frames
                     except Exception as exc:
                         log.warning("camera controls: %s", exc)
@@ -664,6 +805,10 @@ class CameraService:
                 else:
                     settle = 0.0
                 self.ready_at = time.time() + settle
+            with self.cond:
+                jobs, self._jobs = self._jobs, []
+            for job in jobs:
+                job(cap)
             with self.cond:
                 want = self._decode_requests > 0
                 preview = "preview" in self.users and now - last_preview >= 1.0 / self.preview_hz
@@ -703,6 +848,29 @@ class CameraService:
     def preview_frame(self) -> tuple[Optional[np.ndarray], float]:
         with self.cond:
             return self.latest, self.latest_ts
+
+    def run_on_camera(self, fn: Callable, timeout: float = 5.0):
+        """Run fn(cap) on the camera thread (OpenCV captures are not safe to
+        use from two threads) and return its result. Raises if not running."""
+        if not self.running or threading.current_thread() is self.thread:
+            raise RuntimeError("camera is not open")
+        done = threading.Event()
+        box: dict = {}
+
+        def job(cap):
+            try:
+                box["value"] = fn(cap)
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+        with self.cond:
+            self._jobs.append(job)
+        if not done.wait(timeout):
+            raise RuntimeError("camera did not respond")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
 
 
 # =============================================================================
@@ -791,7 +959,8 @@ class ThermalVideoRecorder:
         for kind in self.outputs:
             self.procs[kind] = subprocess.Popen(
                 self._cmd(kind, base), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=ffmpeg_log_file(self.log_dir, f"ffmpeg_thermal_{kind}.log"))
+                stderr=ffmpeg_log_file(self.log_dir, f"ffmpeg_thermal_{kind}.log"),
+                **no_window_kwargs())
         self._frames_csv = open(base + "_thermal_frames.csv", "w", newline="")
         self._frames_writer = csv.writer(self._frames_csv)
         self._frames_writer.writerow(["frame_in_chunk", "local_time", "unix_time",
@@ -1116,7 +1285,7 @@ class PhotoCapturer:
                 return
             path = f"{base}_camera.{s.image_ext}"
             params = [cv2.IMWRITE_JPEG_QUALITY, int(s.jpeg_quality)] if s.image_ext == "jpg" else []
-            if cv2.imwrite(path, frame, params):
+            if imwrite(path, frame, params):
                 result["files"].append(path)
                 result["camera"] = frame
             else:
@@ -1138,7 +1307,7 @@ class PhotoCapturer:
             result["thermal"] = img
             if s.thermal_image:
                 path = f"{base}_thermal.png"
-                if cv2.imwrite(path, img):
+                if imwrite(path, img):
                     result["files"].append(path)
 
             # Temperature data is stored UNCORRECTED (straight from the sensor),
@@ -1153,7 +1322,8 @@ class PhotoCapturer:
                     np.savetxt(path, data, fmt="%.3f", delimiter=",")
                 elif s.thermal_data == "png16":
                     path = f"{base}_thermal_{suffix}_K64.png"
-                    cv2.imwrite(path, celsius_to_raw(np.clip(data, -273.0, 750.0)))
+                    if not imwrite(path, celsius_to_raw(np.clip(data, -273.0, 750.0))):
+                        raise OSError(f"could not write {path}")
                 else:
                     return
                 result["files"].append(path)
@@ -1291,7 +1461,7 @@ _CTRL_RE = re.compile(r"^\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$")
 
 def _v4l2(args: list[str], timeout: float = 3.0) -> str:
     res = subprocess.run(["v4l2-ctl", *args], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, timeout=timeout)
+                         stderr=subprocess.PIPE, text=True, timeout=timeout, **no_window_kwargs())
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or f"v4l2-ctl {' '.join(args)} failed")
     return res.stdout
@@ -1374,31 +1544,238 @@ def camera_controls_auto(device: str) -> None:
     log.info("camera controls back to auto on %s", device)
 
 
+
+
+def have_v4l2_ctl() -> bool:
+    return sys.platform.startswith("linux") and shutil.which("v4l2-ctl") is not None
+
+
+class CameraControls:
+    """Exposure / gain / white balance / focus on one camera.
+
+    read() -> {key: value}; manual(values) -> applied; lock() -> applied; auto().
+    Keys: exposure, gain, wb, focus. Units are the platform's own (V4L2:
+    exposure in 100 us; DirectShow: log2 seconds, e.g. -6 = 1/64 s), which is
+    why READ fills the fields from the camera rather than expecting typed units.
+    """
+
+    def read(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    def manual(self, values: dict[str, Optional[int]]) -> dict[str, int]:
+        raise NotImplementedError
+
+    def auto(self) -> None:
+        raise NotImplementedError
+
+    def lock(self) -> dict[str, int]:
+        return self.manual(self.read())
+
+
+class V4L2Controls(CameraControls):
+    """Linux, through v4l2-ctl -- works even while FFmpeg streams the camera."""
+
+    def __init__(self, device: str) -> None:
+        self.device = device
+
+    def read(self):
+        return camera_controls_read(self.device)
+
+    def manual(self, values):
+        return camera_controls_manual(self.device, values)
+
+    def auto(self):
+        camera_controls_auto(self.device)
+
+
+class OpenCVControls(CameraControls):
+    """Windows (DirectShow / Media Foundation), macOS and Linux without
+    v4l2-ctl, through OpenCV capture properties on an open camera.
+
+    Must be used on the thread that owns `cap`. What a camera supports varies;
+    unsupported controls are left out of read() and ignored by manual().
+    """
+
+    VALUE_PROPS = {"exposure": cv2.CAP_PROP_EXPOSURE, "gain": cv2.CAP_PROP_GAIN,
+                   "wb": cv2.CAP_PROP_WB_TEMPERATURE, "focus": cv2.CAP_PROP_FOCUS}
+    AUTO_PROPS = {"exposure": cv2.CAP_PROP_AUTO_EXPOSURE, "gain": cv2.CAP_PROP_AUTO_EXPOSURE,
+                  "wb": cv2.CAP_PROP_AUTO_WB, "focus": cv2.CAP_PROP_AUTOFOCUS}
+
+    def __init__(self, cap, backend: Optional[int] = None) -> None:
+        self.cap = cap
+        self.backend = backend
+        # V4L2 takes its menu values (1 = manual, 3 = aperture priority);
+        # DirectShow / MSMF / AVFoundation take a flag (0 = manual, 1 = auto).
+        self.ae_manual, self.ae_auto = (1, 3) if backend == cv2.CAP_V4L2 else (0, 1)
+
+    def _get(self, prop) -> Optional[float]:
+        try:
+            v = float(self.cap.get(prop))
+        except Exception:
+            return None
+        return v if np.isfinite(v) and v != -1 else None
+
+    def read(self):
+        out = {}
+        for key, prop in self.VALUE_PROPS.items():
+            v = self._get(prop)
+            if v is None or (key == "wb" and v <= 0):
+                continue
+            if self.backend == cv2.CAP_AVFOUNDATION:
+                # AVFoundation reports 0 for controls it does not have; only
+                # trust a value the camera also accepts back (no side effect:
+                # it is the current value).
+                try:
+                    if not self.cap.set(prop, v):
+                        continue
+                except Exception:
+                    continue
+            out[key] = int(round(v))
+        return out
+
+    def manual(self, values):
+        applied = {}
+        for key, val in values.items():
+            if val is None or key not in self.VALUE_PROPS:
+                continue
+            auto_prop = self.AUTO_PROPS[key]
+            off = self.ae_manual if auto_prop == cv2.CAP_PROP_AUTO_EXPOSURE else 0
+            try:
+                self.cap.set(auto_prop, off)            # auto off first
+                if self.cap.set(self.VALUE_PROPS[key], float(val)):
+                    applied[key] = int(val)
+            except Exception as exc:
+                log.warning("camera control %s=%s: %s", key, val, exc)
+        log.info("camera controls set to manual: %s", applied)
+        return applied
+
+    def auto(self):
+        for prop, on in ((cv2.CAP_PROP_AUTO_EXPOSURE, self.ae_auto),
+                         (cv2.CAP_PROP_AUTO_WB, 1), (cv2.CAP_PROP_AUTOFOCUS, 1)):
+            try:
+                self.cap.set(prop, on)
+            except Exception:
+                pass
+        log.info("camera controls back to auto")
+
+
+class ServiceControls(CameraControls):
+    """OpenCV controls on the camera that CameraService currently has open."""
+
+    def __init__(self, service: "CameraService") -> None:
+        self.service = service
+
+    def _call(self, name, *args):
+        backend = self.service.backend
+        return self.service.run_on_camera(
+            lambda cap: getattr(OpenCVControls(cap, backend), name)(*args))
+
+    def read(self):
+        return self._call("read")
+
+    def manual(self, values):
+        return self._call("manual", values)
+
+    def auto(self):
+        return self._call("auto")
+
+    def lock(self):
+        return self._call("lock")
+
+
+class TemporaryControls(CameraControls):
+    """Opens the camera just to apply settings, then closes it again.
+
+    Used on Windows / macOS when FFmpeg is about to record: FFmpeg opens the
+    camera itself and cannot set these, but UVC cameras keep the values while
+    they stay powered. `settle_s` lets auto exposure / AWB / AF settle first
+    (for "Lock at start")."""
+
+    def __init__(self, device: str, settle_s: float = 0.0) -> None:
+        self.device = device
+        self.settle_s = settle_s
+
+    def _run(self, name, *args):
+        index = device_index(self.device)
+        if sys.platform.startswith("win"):
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+        elif sys.platform == "darwin":
+            backends = [cv2.CAP_AVFOUNDATION]
+        else:
+            backends = [cv2.CAP_V4L2]
+        last = None
+        for backend in backends:
+            src = self.device if backend == cv2.CAP_V4L2 else index
+            cap = cv2.VideoCapture(src, backend)
+            try:
+                if not cap.isOpened():
+                    last = RuntimeError(f"could not open {self.device}")
+                    continue
+                t_end = time.time() + self.settle_s
+                while time.time() < t_end:
+                    cap.grab()
+                return getattr(OpenCVControls(cap, backend), name)(*args)
+            finally:
+                cap.release()
+                time.sleep(0.3)
+        raise last or RuntimeError(f"could not open {self.device}")
+
+    def read(self):
+        return self._run("read")
+
+    def manual(self, values):
+        return self._run("manual", values)
+
+    def auto(self):
+        return self._run("auto")
+
+    def lock(self):
+        return self._run("lock")
+
+
 # =============================================================================
 # Keep the machine awake while capturing
 # =============================================================================
 class SleepInhibitor:
-    """Holds a systemd-logind block inhibitor for sleep / idle / lid switch."""
+    """Keeps the machine awake during a capture.
+
+    Linux: a systemd-logind block inhibitor for sleep / idle / lid switch.
+    Windows: SetThreadExecutionState (system + away mode required). Must be
+    called from a long-lived thread -- the GUI thread is.
+    macOS: `caffeinate -ims`.
+    """
+
+    _ES_CONTINUOUS = 0x80000000
+    _ES_SYSTEM_REQUIRED = 0x00000001
+    _ES_AWAYMODE_REQUIRED = 0x00000040
 
     def __init__(self) -> None:
         self.proc: Optional[subprocess.Popen] = None
+        self._win_active = False
 
     @property
     def active(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        return self._win_active or (self.proc is not None and self.proc.poll() is None)
 
     def acquire(self, why: str) -> bool:
         if self.active:
             return True
-        exe = shutil.which("systemd-inhibit")
-        if not exe:
-            log.warning("systemd-inhibit not found: the machine may suspend during capture")
-            return False
+        if sys.platform.startswith("win"):
+            return self._acquire_windows(why)
+        if sys.platform == "darwin":
+            cmd = ["caffeinate", "-ims"]
+            if not shutil.which(cmd[0]):
+                log.warning("caffeinate not found: the machine may sleep during capture")
+                return False
+        else:
+            exe = shutil.which("systemd-inhibit")
+            if not exe:
+                log.warning("systemd-inhibit not found: the machine may suspend during capture")
+                return False
+            cmd = [exe, "--what=sleep:idle:handle-lid-switch", "--who=Amin Studio",
+                   f"--why={why}", "--mode=block", "sleep", "infinity"]
         try:
-            self.proc = subprocess.Popen(
-                [exe, "--what=sleep:idle:handle-lid-switch", "--who=Amin Studio",
-                 f"--why={why}", "--mode=block", "sleep", "infinity"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.2)
             if self.proc.poll() is not None:
                 log.warning("sleep inhibitor exited immediately (code %s)", self.proc.returncode)
@@ -1411,7 +1788,32 @@ class SleepInhibitor:
             self.proc = None
             return False
 
+    def _acquire_windows(self, why: str) -> bool:
+        try:
+            import ctypes
+            flags = self._ES_CONTINUOUS | self._ES_SYSTEM_REQUIRED | self._ES_AWAYMODE_REQUIRED
+            if not ctypes.windll.kernel32.SetThreadExecutionState(flags):
+                # away mode is refused on some machines; system-required alone still works
+                if not ctypes.windll.kernel32.SetThreadExecutionState(
+                        self._ES_CONTINUOUS | self._ES_SYSTEM_REQUIRED):
+                    log.warning("SetThreadExecutionState refused: the PC may sleep during capture")
+                    return False
+            self._win_active = True
+            log.info("sleep blocked (Windows): %s", why)
+            return True
+        except Exception as exc:
+            log.warning("could not block sleep: %s", exc)
+            return False
+
     def release(self) -> None:
+        if self._win_active:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(self._ES_CONTINUOUS)
+            except Exception:
+                pass
+            self._win_active = False
+            log.info("sleep allowed again")
         if self.proc is not None:
             try:
                 self.proc.terminate()

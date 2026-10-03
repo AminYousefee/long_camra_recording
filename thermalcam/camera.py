@@ -22,7 +22,7 @@ import os
 import platform
 import sys
 import time
-from typing import Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 # Both must be set before cv2 is imported.
 # MSMF's hardware transform path can force format conversion in the driver,
@@ -40,6 +40,7 @@ import numpy as np  # noqa: E402
 
 from . import decode  # noqa: E402
 from .capture_config import STRATEGIES, Strategy, convert_rgb_readback  # noqa: E402
+from .ffmpeg_capture import CAP_FFMPEG_RAW, FFmpegRawCapture  # noqa: E402
 from .devices import find_by_name, list_video_devices  # noqa: E402
 from .decode import (FRAME_HEIGHT, SENSOR_HEIGHT, SENSOR_WIDTH,  # noqa: E402
                      FrameLayoutError, detect_byte_order, normalize_buffer,
@@ -70,6 +71,10 @@ class ThermalCameraError(RuntimeError):
     """Raised when the camera cannot be opened in a usable (raw) mode."""
 
 
+class OpenCancelled(ThermalCameraError):
+    """Raised by :meth:`ThermalCamera.open` when ``should_stop`` became true."""
+
+
 def set_opencv_log_level(verbose: bool) -> None:
     """Silence OpenCV's videoio chatter unless asked for.
 
@@ -88,7 +93,18 @@ def set_opencv_log_level(verbose: bool) -> None:
         pass
 
 
+#: The FFmpeg backend has a fixed format, so a single no-op "strategy".
+FFMPEG_STRATEGY = Strategy("ffmpeg_raw", lambda cap, w, h, fps: None,
+                           "raw YUYV bytes piped from FFmpeg")
+
+
+def _strategies_for(backend: int, strategies: list) -> list:
+    return [FFMPEG_STRATEGY] if backend == CAP_FFMPEG_RAW else strategies
+
+
 def _backend_name(backend: int) -> str:
+    if backend == CAP_FFMPEG_RAW:
+        return "FFMPEG_RAW"
     for name in ("CAP_DSHOW", "CAP_MSMF", "CAP_V4L2", "CAP_AVFOUNDATION", "CAP_ANY"):
         if getattr(cv2, name, None) == backend:
             return name
@@ -104,10 +120,11 @@ def _platform_backends() -> list[int]:
     combination is validated before it is accepted.
     """
     if sys.platform.startswith("win"):
-        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY, CAP_FFMPEG_RAW]
     if sys.platform == "darwin":
-        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
-    return [cv2.CAP_V4L2, cv2.CAP_ANY]
+        # AVFoundation (OpenCV) always converts to BGR: FFmpeg first.
+        return [CAP_FFMPEG_RAW, cv2.CAP_AVFOUNDATION]
+    return [cv2.CAP_V4L2, cv2.CAP_ANY, CAP_FFMPEG_RAW]
 
 
 def has_thermal_geometry(shape: tuple) -> bool:
@@ -188,6 +205,16 @@ class ThermalCamera:
         ``None`` (default) auto-detects byte order from the first frame.
     verbose:
         Let OpenCV's own log messages through. Off by default.
+    exclude:
+        Indices never to probe while scanning (``index=None``) -- e.g. the
+        ordinary camera that is already open elsewhere in the same program.
+        Probing a camera that is in use can disturb it on Windows.
+    preferred:
+        ``(index, backend, strategy_name)`` that worked last time. Tried before
+        anything else, so a re-open takes one attempt instead of a full search.
+    should_stop:
+        Callable checked between attempts; when it returns True, :meth:`open`
+        gives up promptly with :class:`OpenCancelled`.
 
     Example
     -------
@@ -204,7 +231,10 @@ class ThermalCamera:
                  gain: float = 1.0,
                  swap_bytes: Optional[bool] = None,
                  max_scan_index: int = 10,
-                 verbose: bool = False) -> None:
+                 verbose: bool = False,
+                 exclude: Iterable[int] = (),
+                 preferred: Optional[tuple] = None,
+                 should_stop: Optional[Callable[[], bool]] = None) -> None:
         self.index = index
         self.name = name
         self.backend = backend
@@ -214,6 +244,9 @@ class ThermalCamera:
         self.swap_bytes = swap_bytes
         self.max_scan_index = max_scan_index
         self.verbose = verbose
+        self.exclude = {int(i) for i in exclude if i is not None}
+        self.preferred = preferred
+        self.should_stop = should_stop
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._resolved_index: Optional[int] = None
@@ -252,13 +285,16 @@ class ThermalCamera:
         if index is not None:
             indices = [index]
         else:
-            available = [device for device in self.devices if device.index is not None]
+            available = [device for device in self.devices
+                         if device.index is not None and device.index not in self.exclude]
             thermal = [device.index for device in available if device.looks_thermal]
             unknown = [device.index for device in available
                        if not device.looks_thermal and "webcam" not in device.name.lower()]
             webcams = [device.index for device in available
                        if not device.looks_thermal and "webcam" in device.name.lower()]
-            indices = thermal + unknown + webcams or list(range(self.max_scan_index))
+            indices = thermal + unknown + webcams
+            if not indices and not self.devices:
+                indices = [i for i in range(self.max_scan_index) if i not in self.exclude]
         backends = [self.backend] if self.backend is not None \
             else _platform_backends()
         strategies = [s for s in STRATEGIES
@@ -267,25 +303,57 @@ class ThermalCamera:
             raise ValueError(f"Unknown strategy {self.strategy!r}. "
                              f"Available: {[s.name for s in STRATEGIES]}")
 
-        self.attempts = []
-        for index in indices:
+        # What worked last time goes first: a reconnect then costs one open
+        # instead of a search through every backend/strategy (on Windows the
+        # DirectShow attempts alone take several seconds, and all of them fail
+        # for this camera because DSHOW converts its stream).
+        plan = []
+        if self.preferred is not None:
+            p_index, p_backend, p_strategy = self.preferred
+            strat = next((s for s in _strategies_for(p_backend, strategies)
+                          if s.name == p_strategy), None)
+            if strat is not None and p_index in indices and p_backend in backends:
+                plan.append((p_index, p_backend, [strat], True))
+        for idx in indices:
             for backend in backends:
-                for strat in strategies:
-                    cap, present = self._try_configuration(index, backend, strat)
-                    if cap is not None:
-                        self._cap = cap
-                        self._resolved_index = index
-                        self._resolved_backend = backend
-                        self._resolved_strategy = strat.name
-                        log.info("Opened thermal camera: index %d, %s, strategy %s",
-                                 index, _backend_name(backend), strat.name)
-                        return self
-                    if not present:
-                        # Nothing here at all -- no point trying four more
-                        # property orderings against a device that will not open.
-                        break
+                plan.append((idx, backend, _strategies_for(backend, strategies), False))
 
+        self.attempts = []
+        tried = set()
+        for idx, backend, strats, is_preferred in plan:
+            for strat in strats:
+                key = (idx, backend, strat.name)
+                if key in tried:
+                    continue
+                tried.add(key)
+                self._check_stop()
+                cap, present = self._try_configuration(idx, backend, strat)
+                if cap is not None:
+                    self._cap = cap
+                    self._resolved_index = idx
+                    self._resolved_backend = backend
+                    self._resolved_strategy = strat.name
+                    log.info("Opened thermal camera: index %d, %s, strategy %s",
+                             idx, _backend_name(backend), strat.name)
+                    return self
+                if not present and not is_preferred:
+                    # Nothing here at all -- no point trying four more
+                    # property orderings against a device that will not open.
+                    break
+
+        self._check_stop()
         raise ThermalCameraError(self._diagnosis())
+
+    def _check_stop(self) -> None:
+        if self.should_stop is not None and self.should_stop():
+            raise OpenCancelled("thermal camera open cancelled")
+
+    @property
+    def resolved(self) -> Optional[tuple]:
+        """``(index, backend, strategy)`` actually in use, for ``preferred=``."""
+        if self._cap is None:
+            return None
+        return (self._resolved_index, self._resolved_backend, self._resolved_strategy)
 
     def _try_configuration(self, index: int, backend: int, strat: Strategy
                            ) -> tuple[Optional[cv2.VideoCapture], bool]:
@@ -309,11 +377,18 @@ class ThermalCamera:
         # an open issued shortly after the same device was released can fail on
         # a camera that is perfectly present -- which then looks identical to
         # "not plugged in". One short retry removes that false negative.
-        cap = cv2.VideoCapture(index, backend)
-        if not cap.isOpened():
-            cap.release()
-            time.sleep(RELEASE_SETTLE_S * 4)
+        if backend == CAP_FFMPEG_RAW:
+            cap = FFmpegRawCapture(index)
+            if not cap.isOpened():
+                self.attempts.append(_Attempt(index, backend, strat.name,
+                                              f"ffmpeg: {cap.error}"[:160]))
+                return None, True
+        else:
             cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                cap.release()
+                time.sleep(RELEASE_SETTLE_S * 4)
+                cap = cv2.VideoCapture(index, backend)
 
         if not cap.isOpened():
             cap.release()
@@ -336,6 +411,9 @@ class ThermalCamera:
         reason, seen_shape = "no frames arrived", None
 
         for _ in range(SETTLE_FRAMES):
+            if self.should_stop is not None and self.should_stop():
+                cap.release()
+                raise OpenCancelled("thermal camera open cancelled")
             ok, raw_frame = cap.read()
             if not ok or raw_frame is None:
                 continue
@@ -505,7 +583,8 @@ class ThermalCamera:
         """What actually got negotiated -- useful when debugging a new machine."""
         if self._cap is None:
             return {"open": False}
-        fourcc = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc = (int.from_bytes(b"YUYV", "little") if self._resolved_backend == CAP_FFMPEG_RAW
+                  else int(self._cap.get(cv2.CAP_PROP_FOURCC)))
         return {
             "open": True,
             "index": self._resolved_index,

@@ -32,6 +32,13 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
+
+def _no_window() -> dict:
+    """Do not flash a console window for helper processes on Windows."""
+    if sys.platform.startswith("win"):
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
 #: Substrings that identify a TC001-class thermal camera by device name.
 #: The TC001 usually enumerates under the InfiRay sensor module's name rather
 #: than TOPDON's, since TOPDON rebadge InfiRay hardware. Generic USB-camera
@@ -96,7 +103,7 @@ def _windows_ffmpeg() -> list[VideoDevice]:
     try:
         result = subprocess.run(
             [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=15, **_no_window())
     except (OSError, subprocess.SubprocessError):
         return []
 
@@ -143,7 +150,7 @@ def _windows_pnp() -> list[VideoDevice]:
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=25)
+            capture_output=True, text=True, timeout=25, **_no_window())
     except (OSError, subprocess.SubprocessError):
         return []
 
@@ -254,7 +261,7 @@ def snapshot_pnp_devices() -> dict[str, PnpEntry]:
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60, **_no_window())
     except (OSError, subprocess.SubprocessError):
         return {}
 
@@ -307,7 +314,7 @@ def _macos_avfoundation() -> list[VideoDevice]:
         try:
             result = subprocess.run(
                 [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "avfoundation", "-i", ""],
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, timeout=15, **_no_window())
         except (OSError, subprocess.SubprocessError):
             result = None
 
