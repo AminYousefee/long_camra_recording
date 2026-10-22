@@ -297,6 +297,13 @@ def _linux_v4l2() -> list[VideoDevice]:
         return devices
     for entry in sorted(root.glob("video*"), key=lambda p: int(
             re.sub(r"\D", "", p.name) or 0)):
+        # UVC cameras expose a second node per camera for metadata; only the
+        # one with index 0 delivers frames.
+        try:
+            if (entry / "index").read_text().strip() not in ("", "0"):
+                continue
+        except OSError:
+            pass
         name_file = entry / "name"
         try:
             name = name_file.read_text().strip()
@@ -353,15 +360,22 @@ def _macos_avfoundation() -> list[VideoDevice]:
 
 # --- Public ------------------------------------------------------------------
 
-def list_video_devices() -> list[VideoDevice]:
+def list_video_devices(include_pnp: bool = True) -> list[VideoDevice]:
     """Every video capture device the OS reports, best effort.
 
     Windows and macOS use their native capture APIs through FFmpeg (with
     optional platform-specific enumerators preferred when available). Linux
     uses the V4L2 device nodes.
+
+    include_pnp (Windows only): also list cameras Windows knows about but
+    DirectShow cannot address (names only, index None). That needs PowerShell,
+    which takes seconds, so the capture code leaves it out; it is for
+    diagnostics.
     """
     if sys.platform.startswith("win"):
         dshow = _windows_directshow()
+        if not include_pnp:
+            return dshow
         known = {d.name.lower() for d in dshow}
         extra = [d for d in _windows_pnp() if d.name.lower() not in known]
         return dshow + extra
@@ -376,7 +390,7 @@ def find_thermal_index() -> Optional[int]:
     Returns None if no device matched, or if we could not enumerate names at
     all -- in which case the caller should fall back to probing indices.
     """
-    for device in list_video_devices():
+    for device in list_video_devices(include_pnp=False):
         if device.looks_thermal and device.index is not None:
             return device.index
     return None
@@ -391,7 +405,7 @@ def find_by_name(fragment: str) -> Optional[int]:
     2
     """
     low = fragment.lower()
-    for device in list_video_devices():
+    for device in list_video_devices(include_pnp=False):
         if low in device.name.lower() and device.index is not None:
             return device.index
     return None

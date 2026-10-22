@@ -1,0 +1,15 @@
+[dshow @ 000001] DirectShow video device options (from video devices)
+[dshow @ 000001]  Pin "Capture" (alternative pin name "0")
+[dshow @ 000001]   pixel_format=yuyv422  min s=16x15505 fps=25 max s=16x15505 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=256x192 fps=25 max s=256x192 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=256x196 fps=25 max s=256x196 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=256x392 fps=25 max s=256x392 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=256x392 fps=25 max s=256x392 fps=25 (tv, bt470bg/bt709/unknown, topleft)
+[dshow @ 000001]   pixel_format=yuyv422  min s=4x12305 fps=25 max s=4x12305 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=4x12621 fps=25 max s=4x12621 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=512x384 fps=25 max s=512x384 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=512x484 fps=25 max s=512x484 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=520x192 fps=25 max s=520x192 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=60x3299 fps=25 max s=60x3299 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=644x384 fps=25 max s=644x384 fps=25
+[dshow @ 000001]   pixel_format=yuyv422  min s=8x12578 fps=25 max s=8x12578 fps=25

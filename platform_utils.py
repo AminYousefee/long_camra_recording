@@ -46,7 +46,14 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen], timeout: float = 10.0) -> None
     TerminateProcess -- an instant kill that leaves the last file without its
     index. Sending "q" on stdin is FFmpeg's own clean-exit command and works on
     every OS (the process must have been started with stdin=PIPE)."""
-    if proc is None or proc.poll() is not None:
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
         return
     try:
         if proc.stdin is not None:

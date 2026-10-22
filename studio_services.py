@@ -22,14 +22,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
-import cv2
-import numpy as np
+# OpenCV reads these when it is first imported: keep its camera-probing
+# warnings ("can't grab frame", "index out of range") off the console.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
-from platform_utils import imwrite, no_window_kwargs
-from thermalcam import Calibration, TemperatureSpan, ThermalCamera
-from thermalcam.camera import OpenCancelled
-from thermalcam.decode import SENSOR_HEIGHT, SENSOR_WIDTH, celsius_to_raw
-from thermalcam.render import COLORMAP_NAMES, colorbar, colorize_celsius, draw_marker, label
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+
+from platform_utils import imwrite, no_window_kwargs, stop_ffmpeg  # noqa: E402
+from thermalcam import Calibration, TemperatureSpan, ThermalCamera  # noqa: E402
+from thermalcam.camera import OpenCancelled  # noqa: E402
+from thermalcam.decode import SENSOR_HEIGHT, SENSOR_WIDTH, celsius_to_raw  # noqa: E402
+from thermalcam.modes import DeviceRef, Mode, choose_recording_mode, list_modes  # noqa: E402
+from thermalcam.render import COLORMAP_NAMES, colorbar, colorize_celsius, draw_marker, label  # noqa: E402
 
 log = logging.getLogger("studio")
 
@@ -111,7 +117,7 @@ class ThermalPipeline:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.span = TemperatureSpan.auto()
-        self.colormap = "inferno"
+        self.colormap = "gray"
         self.calib = Calibration()
         self.correction = "off"
         self.offset_c = 0.0
@@ -312,8 +318,8 @@ class ThermalPipeline:
                 self.span = TemperatureSpan.from_dict(data.get("span", {}))
             except Exception:
                 self.span = TemperatureSpan.auto()
-            cm = data.get("colormap", "inferno")
-            self.colormap = cm if cm in COLORMAP_NAMES else "inferno"
+            cm = data.get("colormap", "gray")
+            self.colormap = cm if cm in COLORMAP_NAMES else "gray"
             corr = data.get("correction", "off")
             self.correction = corr if corr in self.CORRECTIONS else "off"
             self.offset_c = float(data.get("offset_c", 0.0))
@@ -575,7 +581,10 @@ class ThermalService:
     def status_text(self) -> str:
         if self.status == "ONLINE":
             where = self.device or f"index {self.info.get('index', '?')}"
-            return f"{where}  •  ONLINE  {self.fps:4.1f} fps"
+            mode = ""
+            if self.info.get("approximate"):
+                mode = "  •  APPROX. (no temperature mode)"
+            return f"{where}  •  ONLINE  {self.fps:4.1f} fps{mode}"
         if self.status in ("ERROR", "RECONNECTING"):
             return f"{self.status}  •  {self.error[:70]}"
         return self.status
@@ -756,6 +765,7 @@ class CameraService:
                 predecessor.join(timeout=0.2)
         cap = None
         failures = 0
+        first_failure = None
         last_preview = 0.0
         hook_done = False
         while not stop.is_set():
@@ -782,8 +792,13 @@ class CameraService:
 
             if not cap.grab():
                 failures += 1
-                if failures > 20:
-                    self._publish(stop, error="grab() keeps failing", status="RECONNECTING")
+                if first_failure is None:
+                    first_failure = time.time()
+                # Count and time both: one Media Foundation grab can block for
+                # 10 s, so 20 failures could otherwise take minutes.
+                if failures > 20 or time.time() - first_failure > 5.0:
+                    self._publish(stop, error="no frames from the camera (grab keeps failing)",
+                                  status="RECONNECTING")
                     cap.release()
                     cap = None
                     stop.wait(2.0)
@@ -791,6 +806,7 @@ class CameraService:
                     time.sleep(0.05)
                 continue
             failures = 0
+            first_failure = None
 
             now = time.time()
             if not hook_done and now - self.opened_at >= self.WARMUP_S:
@@ -874,6 +890,366 @@ class CameraService:
 
 
 # =============================================================================
+# Camera recorder: the FFmpeg process that records the normal camera
+# =============================================================================
+HW_ENCODERS = ("h264_qsv", "h264_vaapi", "h264_videotoolbox", "h264_nvenc", "h264_amf", "h264_mf")
+
+_ENCODER_ERRORS = ("error while opening encoder", "error initializing output stream",
+                   "mfx session", "qsv", "vaapi", "videotoolbox", "nvenc", "amf", "cannot load",
+                   "unknown encoder", "encoder not found", "hwupload", "device creation failed",
+                   "no device available for encoder")
+_MODE_ERRORS = ("could not set video options", "not supported by the device",
+                "selected framerate", "selected video size", "could not find a matching",
+                "unable to set")
+_DEVICE_BUSY = ("i/o error", "input/output error", "device or resource busy", "could not run graph",
+                "error opening input", "could not find video device", "no such file or directory",
+                "could not open", "cannot open video device", "access is denied")
+
+_encoder_ok: dict = {}
+
+
+def encoder_works(codec: str, timeout: float = 20.0) -> tuple[bool, str]:
+    """Can FFmpeg encode with `codec` on this machine? (cached per session)
+
+    GPU encoders are listed by FFmpeg whether or not the GPU / driver exists,
+    so the only real test is to encode a few frames of a test pattern.
+    """
+    if codec in _encoder_ok:
+        return _encoder_ok[codec]
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False, "ffmpeg not found on PATH"
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi",
+           "-i", "testsrc2=size=1280x720:rate=30", "-frames:v", "15"]
+    if codec == "h264_vaapi":
+        cmd += ["-vaapi_device", "/dev/dri/renderD128", "-vf", "format=nv12,hwupload"]
+    else:
+        cmd += ["-pix_fmt", "nv12" if codec in HW_ENCODERS else "yuv420p"]
+    cmd += ["-c:v", codec, "-f", "null", "-"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=timeout, **no_window_kwargs())
+        err = res.stderr.decode(errors="replace").strip().splitlines()
+        result = (res.returncode == 0, " | ".join(err[-2:])[:240])
+    except (OSError, subprocess.SubprocessError) as exc:
+        result = (False, str(exc)[:240])
+    _encoder_ok[codec] = result
+    return result
+
+
+def _classify_ffmpeg_error(text: str) -> str:
+    low = text.lower()
+    if any(k in low for k in _ENCODER_ERRORS):
+        return "encoder"
+    if any(k in low for k in _MODE_ERRORS):
+        return "mode"
+    if any(k in low for k in _DEVICE_BUSY):
+        return "device"
+    return "other"
+
+
+def _last_lines(path: Optional[str], offset: int, n: int = 6) -> str:
+    """Last meaningful lines FFmpeg wrote to its log since `offset`."""
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()[-20000:].decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in data.splitlines()
+             if ln.strip() and not ln.startswith("=====")
+             and "real-time buffer" not in ln and "Past duration" not in ln]
+    return " | ".join(lines[-n:])
+
+
+@dataclass
+class RecordingRequest:
+    """What the user asked for in the VIDEO tab."""
+
+    device: DeviceRef
+    width: int
+    height: int
+    fps: float
+    codec: str
+    preset: str
+    crf: str
+    chunk_sec: int
+    out_dir: str
+    prefix: str
+    preview_path: Optional[str] = None      # JPEG refreshed while recording
+    preview_every_s: float = 1.0
+    log_dir: Optional[str] = None
+
+
+class CameraRecorder:
+    """Records the normal camera with FFmpeg into clock-aligned chunks.
+
+    What it does that a bare Popen does not:
+
+    * records in a mode the camera really has (``thermalcam.modes``): asking
+      DirectShow for 3840x2160 MJPEG on a 1080p webcam makes FFmpeg exit at
+      once, which used to look like a crash;
+    * tests a GPU encoder before relying on it and falls back to libx264;
+    * when FFmpeg exits, reads *why* from its log and reacts: device busy ->
+      wait and retry; mode refused -> the camera's default mode; encoder
+      failure -> libx264; anything else -> restart with a growing delay
+      (2 s ... 60 s) instead of a tight restart loop.
+
+    The GUI calls :meth:`poll` once a second; it never blocks.
+    """
+
+    MAX_BACKOFF_S = 60.0
+    HEALTHY_AFTER_S = 60.0
+
+    def __init__(self, req: RecordingRequest, *, input_override: Optional[list[str]] = None) -> None:
+        self.req = req
+        self.input_override = input_override       # tests: e.g. a lavfi source
+        self.proc: Optional[subprocess.Popen] = None
+        self.codec = req.codec
+        self.mode: Optional[Mode] = None
+        self.use_default_mode = False
+        self.restarts = 0
+        self.failures_in_row = 0
+        self.started_at = 0.0
+        self.last_error = ""
+        self.notice = ""                       # one-off message for the GUI
+        self.next_retry_at: Optional[float] = None
+        self._log_path: Optional[str] = None
+        self._log_offset = 0
+        self._log_file = None
+        self.stopped = False
+        #: called (GUI thread) right before a restart, e.g. to re-apply exposure
+        self.before_start: Optional[Callable[[], None]] = None
+
+    # --- planning ---------------------------------------------------------------
+    def plan(self) -> None:
+        """Pick encoder and camera mode. Call once before start()."""
+        r = self.req
+        if self.codec in HW_ENCODERS:
+            ok, err = encoder_works(self.codec)
+            if not ok:
+                log.warning("encoder %s does not work here (%s); recording with libx264",
+                            self.codec, err)
+                self.notice = f"{self.codec} UNAVAILABLE ON THIS PC  •  USING LIBX264"
+                self.codec = "libx264"
+        if self.input_override is None:
+            modes = list_modes(r.device)
+            self.mode = choose_recording_mode(modes, r.width, r.height, r.fps)
+            if self.mode is not None and (self.mode.width, self.mode.height) != (r.width, r.height):
+                msg = (f"camera has no {r.width}x{r.height} mode; recording at its "
+                       f"{self.mode.width}x{self.mode.height}")
+                log.warning(msg)
+                self.notice = (self.notice + "  •  " if self.notice else "") + msg.upper()
+            if self.mode is not None:
+                log.info("camera mode for recording: %s (asked %dx%d @ %g fps)", self.mode,
+                         r.width, r.height, r.fps)
+
+    def describe(self) -> str:
+        if self.use_default_mode or (self.mode is None and self.input_override is None):
+            where = "camera default mode" if self.use_default_mode else \
+                f"{self.req.width}x{self.req.height}"
+        elif self.mode is not None:
+            where = str(self.mode)
+        else:
+            where = "test input"
+        return f"{where}, {self.codec}"
+
+    def _fps(self) -> float:
+        fps = float(self.req.fps)
+        if self.mode is not None and self.mode.fps and not self.use_default_mode:
+            fps = min(fps, self.mode.fps)
+        return fps
+
+    def command(self) -> list[str]:
+        r = self.req
+        fps = self._fps()
+        if self.input_override is not None:
+            video_input = list(self.input_override)
+        elif self.use_default_mode:
+            video_input = r.device.ffmpeg_input(rtbufsize="512M")
+        elif self.mode is not None:
+            video_input = r.device.ffmpeg_input(size=self.mode.size, fmt=self.mode.fmt,
+                                                compressed=self.mode.compressed, fps=fps,
+                                                rtbufsize="512M")
+        else:
+            # Mode list unavailable: ask for the size in MJPEG, as before.
+            video_input = r.device.ffmpeg_input(size=f"{r.width}x{r.height}", fmt="mjpeg",
+                                                compressed=True, fps=fps, rtbufsize="512M")
+        out_template = os.path.join(r.out_dir, r.prefix + "_%Y-%m-%d_%H-%M-%S_camera.mkv")
+        segment = ["-f", "segment", "-segment_time", str(r.chunk_sec),
+                   "-segment_atclocktime", "1", "-reset_timestamps", "1", "-strftime", "1",
+                   "-segment_format", "matroska", out_template]
+        gop = str(max(1, int(round(fps * 2))))
+        prev_rate = f"1/{max(1.0, r.preview_every_s):g}"
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "warning"]
+        codec = self.codec
+        if codec == "h264_vaapi":
+            cmd += ["-vaapi_device", "/dev/dri/renderD128"]
+            rec_filter = "format=nv12,hwupload"
+            enc = ["-c:v", "h264_vaapi", "-qp", r.crf]
+        elif codec == "h264_qsv":
+            rec_filter = "format=nv12"
+            enc = ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", r.crf,
+                   "-look_ahead", "0"]
+        elif codec == "h264_videotoolbox":
+            mbps = max(1.0, 2.0 * (2 ** ((23 - float(r.crf)) / 6)) * r.width * r.height / (1920 * 1080))
+            rec_filter = "format=nv12"
+            enc = ["-c:v", "h264_videotoolbox", "-b:v", f"{mbps:.1f}M",
+                   "-maxrate", f"{mbps * 1.5:.1f}M", "-bufsize", f"{mbps * 2:.1f}M",
+                   "-allow_sw", "1"]
+        elif codec in ("h264_mf", "h264_nvenc", "h264_amf"):
+            rec_filter = "format=nv12"
+            enc = ["-c:v", codec, "-b:v", "8M"]
+        else:
+            # MJPEG cameras deliver 4:2:2, and H.264 4:2:2 does not play in most
+            # players (Windows Media Player, phones, browsers): force 4:2:0.
+            rec_filter = "format=yuv420p"
+            enc = ["-c:v", codec, "-preset", r.preset, "-crf", r.crf]
+        cmd += ["-thread_queue_size", "512", *video_input]
+        if r.preview_path:
+            filt = (f"[0:v]split=2[rec_in][prev_in];[rec_in]{rec_filter}[rec_out];"
+                    f"[prev_in]fps={prev_rate},scale=640:-2[prev_out]")
+        else:
+            filt = f"[0:v]{rec_filter}[rec_out]"
+        cmd += ["-filter_complex", filt, "-map", "[rec_out]", *enc, "-g", gop, *segment]
+        if r.preview_path:
+            cmd += ["-map", "[prev_out]", "-q:v", "5", "-update", "1", "-y", r.preview_path]
+        return cmd
+
+    # --- process ------------------------------------------------------------------
+    def start(self) -> bool:
+        """Start FFmpeg. False (with last_error set) if it could not be spawned."""
+        os.makedirs(self.req.out_dir, exist_ok=True)
+        cmd = self.command()
+        cmd[0] = shutil.which("ffmpeg") or "ffmpeg"
+        self._open_log()
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                         stderr=self._log_file or subprocess.DEVNULL,
+                                         **no_window_kwargs())
+        except OSError as exc:
+            self.last_error = f"cannot start ffmpeg: {exc}"
+            log.error("camera recorder: %s", self.last_error)
+            self.proc = None
+            return False
+        self.started_at = time.time()
+        self.next_retry_at = None
+        log.info("camera ffmpeg started (%s): %s", self.describe(), " ".join(cmd))
+        return True
+
+    def _open_log(self) -> None:
+        self._close_log()
+        if not self.req.log_dir:
+            return
+        try:
+            os.makedirs(self.req.log_dir, exist_ok=True)
+            self._log_path = os.path.join(self.req.log_dir, "ffmpeg_camera.log")
+            self._log_file = open(self._log_path, "ab")
+            self._log_file.write(f"\n===== {datetime.now().astimezone().isoformat(timespec='seconds')}"
+                                 f"  {self.describe()} =====\n".encode())
+            self._log_file.flush()
+            self._log_offset = self._log_file.tell()
+        except OSError:
+            self._log_file, self._log_path = None, None
+
+    def _close_log(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+        self._log_file = None
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def poll(self) -> Optional[str]:
+        """Check FFmpeg; restart it when due. Returns a status word when
+        something happened: 'exited', 'restarted', 'retry-failed', or None."""
+        if self.stopped:
+            return None
+        if self.proc is not None:
+            code = self.proc.poll()
+            if code is None:
+                if time.time() - self.started_at > self.HEALTHY_AFTER_S:
+                    self.failures_in_row = 0
+                return None
+            self._on_exit(code)
+            return "exited"
+        if self.next_retry_at is not None and time.time() >= self.next_retry_at:
+            self.restarts += 1
+            if self.before_start is not None:
+                try:
+                    self.before_start()
+                except Exception as exc:
+                    log.warning("before camera restart: %s", exc)
+            if self.start():
+                return "restarted"
+            self._schedule_retry()
+            return "retry-failed"
+        return None
+
+    def _on_exit(self, code: int) -> None:
+        ran = time.time() - self.started_at
+        proc, self.proc = self.proc, None
+        try:
+            if proc is not None and proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if self._log_file is not None:
+            try:
+                self._log_file.flush()
+            except Exception:
+                pass
+        why = _last_lines(self._log_path, self._log_offset) or f"exit code {code}"
+        kind = _classify_ffmpeg_error(why)
+        self.last_error = why[-300:]
+        self.failures_in_row = self.failures_in_row + 1 if ran < self.HEALTHY_AFTER_S else 1
+        log.error("camera ffmpeg exited (code %s after %.0f s, %s): %s", code, ran, kind, why)
+        delay = None
+        if kind == "encoder" and self.codec != "libx264":
+            log.warning("camera encoder %s failed; switching to libx264", self.codec)
+            self.notice = f"{self.codec} FAILED  •  SWITCHED TO LIBX264"
+            self.codec = "libx264"
+            delay = 0.5
+        elif kind == "mode" and not self.use_default_mode and self.input_override is None:
+            log.warning("camera refused mode %s; using its default mode", self.mode)
+            self.notice = "CAMERA REFUSED THE MODE  •  USING ITS DEFAULT MODE"
+            self.use_default_mode = True
+            delay = 1.0
+        elif kind == "device" and self.failures_in_row == 1:
+            delay = 3.0            # usually: the preview had not released the camera yet
+        elif (kind == "device" and self.failures_in_row == 3 and not self.use_default_mode
+              and self.input_override is None):
+            self.use_default_mode = True
+            delay = 3.0
+        self._schedule_retry(delay)
+
+    def _schedule_retry(self, delay: Optional[float] = None) -> None:
+        if delay is None:
+            delay = min(self.MAX_BACKOFF_S, 2.0 * (2 ** max(0, self.failures_in_row - 1)))
+        self.next_retry_at = time.time() + delay
+        log.info("camera ffmpeg restart in %.0f s", delay)
+
+    def take_notice(self) -> str:
+        msg, self.notice = self.notice, ""
+        return msg
+
+    def stop(self, timeout: float = 15.0) -> None:
+        """Stop cleanly so the last chunk is finalised ('q' on stdin)."""
+        self.stopped = True
+        self.next_retry_at = None
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            stop_ffmpeg(proc, timeout=timeout)
+        self._close_log()
+        log.info("camera recorder stopped (%d restarts)", self.restarts)
+
+
+# =============================================================================
 # Thermal video recorder (FFmpeg fed from a pipe, segmented like the main one)
 # =============================================================================
 class ThermalVideoRecorder:
@@ -926,6 +1302,7 @@ class ThermalVideoRecorder:
         self._settings_file = None
         self._settings_writer = None
         self._last_settings = None
+        self._chunk_opened_at = 0.0
         self.color_size = (SENSOR_WIDTH * self.SCALE + COLORBAR_WIDTH,
                            SENSOR_HEIGHT * self.SCALE)
 
@@ -957,15 +1334,22 @@ class ThermalVideoRecorder:
             base = os.path.join(self.out_dir, f"{self.prefix}_{start.strftime(STAMP_FMT)}_part{n}")
         self.chunk_name = os.path.basename(base)
         for kind in self.outputs:
-            self.procs[kind] = subprocess.Popen(
-                self._cmd(kind, base), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=ffmpeg_log_file(self.log_dir, f"ffmpeg_thermal_{kind}.log"),
-                **no_window_kwargs())
+            err = ffmpeg_log_file(self.log_dir, f"ffmpeg_thermal_{kind}.log")
+            try:
+                self.procs[kind] = subprocess.Popen(
+                    self._cmd(kind, base), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=err, **no_window_kwargs())
+            finally:
+                # the child has its own handle; keeping ours open leaked one
+                # file handle per chunk for the whole run
+                if err is not subprocess.DEVNULL:
+                    err.close()
         self._frames_csv = open(base + "_thermal_frames.csv", "w", newline="")
         self._frames_writer = csv.writer(self._frames_csv)
         self._frames_writer.writerow(["frame_in_chunk", "local_time", "unix_time",
                                       "sensor_frame_age_s", "valid"])
         self.chunk_frames = 0
+        self._chunk_opened_at = time.time()
         log.info("thermal chunk opened: %s  (%s)", self.chunk_name, "+".join(self.outputs))
 
     def _close_chunk(self) -> None:
@@ -1110,6 +1494,8 @@ class ThermalVideoRecorder:
         next_t = time.time()
         last_settings_check = 0.0
         last_flush = time.time()
+        retry_at: Optional[float] = None
+        failures = 0
 
         while not self._stop.is_set():
             now = time.time()
@@ -1120,7 +1506,7 @@ class ThermalVideoRecorder:
             if now - next_t > 5 * period:           # fell far behind: resync
                 next_t = now + period
 
-            if datetime.now() >= boundary:
+            if datetime.now() >= boundary and retry_at is None:
                 try:
                     self._open_chunk(boundary)
                 except Exception as exc:
@@ -1135,23 +1521,43 @@ class ThermalVideoRecorder:
             raw_c, ts, _ = self.service.latest()
             fresh = raw_c is not None and (now - ts) < 2.0
 
-            for kind in list(self.procs):
-                proc = self.procs[kind]
-                if proc.poll() is not None:
-                    self.last_error = f"{kind} encoder exited (code {proc.returncode})"
-                    log.error("thermal %s", self.last_error + "; starting a new chunk")
-                    self.restarts += 1
-                    try:
-                        self._open_chunk(datetime.now().replace(microsecond=0))
-                    except Exception as exc:
-                        self.last_error = f"encoder restart failed: {exc}"
-                        log.error("thermal recorder: %s", self.last_error)
-                    break
+            if retry_at is not None:
+                # An encoder died: wait (growing delay) before a new chunk, so a
+                # broken encoder cannot spawn a new process and files every frame.
+                if now < retry_at:
+                    continue
+                retry_at = None
+                try:
+                    self._open_chunk(datetime.now().replace(microsecond=0))
+                    boundary = next_clock_boundary(datetime.now(), self.chunk_sec)
+                except Exception as exc:
+                    self.last_error = f"encoder restart failed: {exc}"
+                    log.error("thermal recorder: %s", self.last_error)
+                    failures += 1
+                    retry_at = now + min(60.0, 2.0 ** failures)
+                    continue
+
+            died = next((k for k, p in self.procs.items() if p.poll() is not None), None)
+            if died is not None:
+                code = self.procs[died].returncode
+                failures = failures + 1 if now - self._chunk_opened_at < 30 else 1
+                delay = min(60.0, 2.0 ** (failures - 1)) if failures > 1 else 0.0
+                self.last_error = f"{died} encoder exited (code {code})"
+                log.error("thermal %s; new chunk in %.0f s (see logs/ffmpeg_thermal_%s.log)",
+                          self.last_error, delay, died)
+                self.restarts += 1
+                self._close_chunk()
+                retry_at = now + delay
+                continue
+
+            for kind, proc in list(self.procs.items()):
                 try:
                     data = self._frame_bytes(kind, raw_c) if fresh else self._blank(kind)
                     proc.stdin.write(data)
                 except (BrokenPipeError, OSError, ValueError) as exc:
                     self.last_error = f"{kind} pipe: {exc}"
+            if not self.procs:
+                continue
             if self._frames_writer is not None:
                 self._frames_writer.writerow([
                     self.chunk_frames,

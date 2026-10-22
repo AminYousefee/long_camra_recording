@@ -1,0 +1,9 @@
+[dshow @ 000003]   pixel_format=yuyv422  min s=640x360 fps=30 max s=640x360 fps=30
+[dshow @ 000003]   pixel_format=yuyv422  min s=640x480 fps=30 max s=640x480 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=1024x576 fps=30 max s=1024x576 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=1280x720 fps=30 max s=1280x720 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=1280x960 fps=30 max s=1280x960 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=1920x1080 fps=30 max s=1920x1080 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=640x360 fps=30 max s=640x360 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=640x480 fps=30 max s=640x480 fps=30
+[dshow @ 000003]   vcodec=mjpeg  min s=800x600 fps=30 max s=800x600 fps=30

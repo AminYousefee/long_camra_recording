@@ -1,0 +1,12 @@
+[dshow @ 000002] DirectShow video device options (from video devices)
+[dshow @ 000002]  Pin "Capture" (alternative pin name "0")
+[dshow @ 000002]   pixel_format=yuyv422  min s=1280x720 fps=10 max s=1280x720 fps=10
+[dshow @ 000002]   pixel_format=yuyv422  min s=640x480 fps=30 max s=640x480 fps=30
+[dshow @ 000002]   pixel_format=yuyv422  min s=800x600 fps=10 max s=800x600 fps=10
+[dshow @ 000002]   vcodec=mjpeg  min s=1280x720 fps=30 max s=1280x720 fps=30
+[dshow @ 000002]   vcodec=mjpeg  min s=1280x960 fps=30 max s=1280x960 fps=30
+[dshow @ 000002]   vcodec=mjpeg  min s=1920x1080 fps=30 max s=1920x1080 fps=30
+[dshow @ 000002]   vcodec=mjpeg  min s=2560x1440 fps=30 max s=2560x1440 fps=30
+[dshow @ 000002]   vcodec=mjpeg  min s=3840x2160 fps=30 max s=3840x2160 fps=30
+[dshow @ 000002]   vcodec=mjpeg  min s=640x480 fps=30 max s=640x480 fps=30
+[dshow @ 000002]   vcodec=mjpeg  min s=800x600 fps=30 max s=800x600 fps=30

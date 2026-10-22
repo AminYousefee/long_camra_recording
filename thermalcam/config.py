@@ -23,7 +23,7 @@ class Config:
 
     device_index: Optional[int] = None      # None = auto-scan
     span: TemperatureSpan = field(default_factory=TemperatureSpan.auto)
-    colormap: str = "inferno"
+    colormap: str = "gray"
     scale: int = 3
     offset_c: float = 0.0
     gain: float = 1.0
@@ -54,7 +54,7 @@ class Config:
         return cls(
             device_index=data.get("device_index"),
             span=TemperatureSpan.from_dict(data.get("span", {})),
-            colormap=data.get("colormap", "inferno"),
+            colormap=data.get("colormap", "gray"),
             scale=data.get("scale", 3),
             offset_c=data.get("offset_c", 0.0),
             gain=data.get("gain", 1.0),

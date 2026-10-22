@@ -1,18 +1,23 @@
 """Capture interface for TOPDON TC001 / TS001 (InfiRay-based UVC thermal cameras).
 
-The hard part is not reading frames -- it is stopping OpenCV from helpfully
-converting them. The camera streams YUY2, and the bottom half of that stream is
-16-bit radiometric data masquerading as pixels. Any YUY2->BGR conversion
-silently turns it into garbage, and you get a picture that looks fine with
-temperatures that are nonsense.
+Opening the camera means three decisions, and each one has burned us:
 
-``CAP_PROP_CONVERT_RGB`` is meant to switch that off, but backends honour it
-inconsistently and OpenCV versions differ. So :meth:`ThermalCamera.open` does not
-trust a backend that merely opens: it works through the configuration
-strategies in :mod:`thermalcam.capture_config`, pulls real frames, and checks
-that what came back decodes to a plausible thermal scene. Only then does it keep
-the combination. If none qualify, it raises -- with the diagnosis -- rather than
-returning a camera that lies.
+* **Which device.** On Windows the TC001 is usually just "UVC Camera" or "USB
+  Camera". Asking each camera which *modes* it offers (a driver query, no
+  stream opened) identifies it reliably: only the thermal camera offers
+  256-px-wide frames or the temperature mode. Ordinary webcams are skipped
+  without being opened -- probing a webcam in the thermal camera's format is
+  what used to hang for minutes on Media Foundation.
+* **Which mode / layout.** Two TC001 revisions exist with different frame
+  layouts (see :mod:`thermalcam.layouts`). The camera's mode list says which
+  one is attached; the best layout it offers is used.
+* **Which capture path.** FFmpeg first on every OS: it opens an exact mode and
+  passes the bytes through untouched. OpenCV (Media Foundation on Windows,
+  V4L2 on Linux) is a fallback for machines without FFmpeg.
+
+Whatever is chosen, the first frames must decode to a plausible thermal scene
+before the camera is accepted -- including a check that the "temperatures"
+are not the camera's 8-bit picture, which decodes to a believable ~240 C.
 """
 
 from __future__ import annotations
@@ -24,47 +29,42 @@ import sys
 import time
 from typing import Callable, Iterable, Iterator, Optional
 
-# Both must be set before cv2 is imported.
-# MSMF's hardware transform path can force format conversion in the driver,
-# defeating CONVERT_RGB entirely.
+# Must be set before cv2 is imported (here or by the application).
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
-# FFmpeg logs through its own channel, not OpenCV's, so silencing OpenCV does
-# not stop "[dshow @ ...] Could not enumerate video devices" during a scan.
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")  # AV_LOG_QUIET
-# Some videoio messages are emitted during backend initialisation, before any
-# runtime setLogLevel() call can take effect. This catches those.
-os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import decode  # noqa: E402
-from .capture_config import STRATEGIES, Strategy, convert_rgb_readback  # noqa: E402
-from .ffmpeg_capture import CAP_FFMPEG_RAW, FFmpegRawCapture  # noqa: E402
-from .devices import find_by_name, list_video_devices  # noqa: E402
+from . import decode, layouts  # noqa: E402
+from .capture_config import STRATEGIES, Strategy  # noqa: E402
 from .decode import (FRAME_HEIGHT, SENSOR_HEIGHT, SENSOR_WIDTH,  # noqa: E402
-                     FrameLayoutError, detect_byte_order, normalize_buffer,
-                     raw_from_thermal, raw_to_celsius, split_halves,
-                     visual_to_gray)
+                     FrameLayoutError, normalize_buffer, raw_to_celsius)
+from .devices import list_video_devices  # noqa: E402
+from .ffmpeg_capture import CAP_FFMPEG_RAW, FFmpegRawCapture  # noqa: E402
 from .frame import ThermalFrame  # noqa: E402
+from .layouts import CLASSIC_384, GRAY_392, Layout, LayoutError  # noqa: E402
+from .modes import DeviceRef, device_refs, list_modes  # noqa: E402
 
 log = logging.getLogger(__name__)
 
 DEFAULT_FPS = 25
 
-#: Minimum :func:`decode.plausibility_score` for a device to be accepted as a
-#: thermal camera. A correctly decoded scene lands near 2.5-3.0; a regular
-#: webcam's bytes score well under 1.
+#: Kept for callers that still import it; validation now uses
+#: :func:`decode.scene_rejection_reason` (an absolute veto, not a score).
 MIN_PLAUSIBILITY = 2.0
 
-#: Frames to discard before judging a configuration. The first reads after a
-#: mode change are routinely stale or the previous size.
-SETTLE_FRAMES = 8
+#: Frames read before giving up on a capture path. The first reads after a
+#: mode change are routinely stale or empty.
+SETTLE_FRAMES = 10
 
-#: Pause after releasing a device before re-opening it. Windows does not free
-#: the handle synchronously, and hammering open/release makes later attempts
-#: spuriously report "would not open".
-RELEASE_SETTLE_S = 0.08
+#: Seconds a capture path gets to deliver a valid frame.
+OPEN_FRAME_TIMEOUT_S = 4.0
+
+#: Pause after releasing a device before opening it again. Windows frees the
+#: handle asynchronously; opening straight away can fail on a present camera.
+RELEASE_SETTLE_S = 0.4
 
 
 class ThermalCameraError(RuntimeError):
@@ -78,33 +78,30 @@ class OpenCancelled(ThermalCameraError):
 def set_opencv_log_level(verbose: bool) -> None:
     """Silence OpenCV's videoio chatter unless asked for.
 
-    Probing camera indices makes OpenCV print ``[ WARN ]`` and ``[ERROR]`` lines
-    for every index that is not a camera -- including alarming-looking
-    ``obsensor_uvc_stream_channel.cpp ... Camera index out of range``. They are
-    entirely normal for a scan and say nothing about the thermal camera, but
-    they bury the output that matters.
+    Probing cameras makes OpenCV print ``[ WARN ]`` lines (``can't grab
+    frame``, ``Camera index out of range``) that say nothing useful and bury
+    the output that matters.
     """
     try:
         logging_utils = cv2.utils.logging
         logging_utils.setLogLevel(
             logging_utils.LOG_LEVEL_INFO if verbose
-            else logging_utils.LOG_LEVEL_SILENT)
+            else logging_utils.LOG_LEVEL_ERROR)
     except AttributeError:  # pragma: no cover - very old/new OpenCV
-        pass
+        try:
+            cv2.setLogLevel(3 if verbose else 2)
+        except Exception:
+            pass
 
 
-#: The FFmpeg backend has a fixed format, so a single no-op "strategy".
+#: The FFmpeg backend has its format fixed on the command line.
 FFMPEG_STRATEGY = Strategy("ffmpeg_raw", lambda cap, w, h, fps: None,
-                           "raw YUYV bytes piped from FFmpeg")
-
-
-def _strategies_for(backend: int, strategies: list) -> list:
-    return [FFMPEG_STRATEGY] if backend == CAP_FFMPEG_RAW else strategies
+                           "raw bytes piped from FFmpeg")
 
 
 def _backend_name(backend: int) -> str:
     if backend == CAP_FFMPEG_RAW:
-        return "FFMPEG_RAW"
+        return "FFMPEG"
     for name in ("CAP_DSHOW", "CAP_MSMF", "CAP_V4L2", "CAP_AVFOUNDATION", "CAP_ANY"):
         if getattr(cv2, name, None) == backend:
             return name
@@ -112,50 +109,30 @@ def _backend_name(backend: int) -> str:
 
 
 def _platform_backends() -> list[int]:
-    """Backends to try, best-first, for the current OS.
+    """OpenCV backends worth trying for raw frames on this OS (fallback only).
 
-    Windows indices come from DirectShow enumeration, so try DSHOW first to
-    keep them stable. This thermal camera's DSHOW path converts the raw payload
-    to BGR; MSMF is tried next and returns the untouched stream. Every
-    combination is validated before it is accepted.
+    DirectShow is left out on Windows: it converts this camera's stream to BGR
+    whatever CAP_PROP_CONVERT_RGB says. AVFoundation (macOS) always converts.
     """
     if sys.platform.startswith("win"):
-        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY, CAP_FFMPEG_RAW]
+        return [cv2.CAP_MSMF]
     if sys.platform == "darwin":
-        # AVFoundation (OpenCV) always converts to BGR: FFmpeg first.
-        return [CAP_FFMPEG_RAW, cv2.CAP_AVFOUNDATION]
-    return [cv2.CAP_V4L2, cv2.CAP_ANY, CAP_FFMPEG_RAW]
+        return []
+    return [cv2.CAP_V4L2]
 
 
 def has_thermal_geometry(shape: tuple) -> bool:
-    """Whether a frame's size is consistent with a 256x384 thermal stream.
-
-    This is what separates "the thermal camera is here but something converted
-    the frame" from "this index is an ordinary webcam". Both come back as
-    3-channel BGR and are otherwise indistinguishable, but they need opposite
-    fixes -- one is a driver problem, the other means look at another index.
-    """
-    expected_bytes = SENSOR_WIDTH * FRAME_HEIGHT * 2
+    """Whether a frame's size is consistent with a TC001-family stream."""
     if len(shape) == 3 and shape[1] == SENSOR_WIDTH:
         extra_rows = shape[0] - FRAME_HEIGHT
-        if 0 <= extra_rows <= 16 and extra_rows % 2 == 0:
-            return True                               # raw, converted, or padded
+        return 0 <= extra_rows <= 16 and extra_rows % 2 == 0
     if len(shape) == 2:
-        rows, cols = shape
-        size = rows * cols
-        if size in (expected_bytes, expected_bytes // 2):
-            return True                               # flat, or uint16-packed
-        row_bytes = SENSOR_WIDTH * 2
-        if rows == 1 and size % row_bytes == 0:
-            padded_rows = size // row_bytes
-            extra_rows = padded_rows - FRAME_HEIGHT
-            if 0 < extra_rows <= 16 and extra_rows % 2 == 0:
-                return True                           # symmetric sensor padding
+        size = int(np.prod(shape))
+        return size in layouts.BY_BYTES or size * 2 in layouts.BY_BYTES
     return False
 
 
 def describe_shape(shape: tuple) -> str:
-    """Human-readable frame size, from the sensor's point of view."""
     if len(shape) == 3:
         return f"{shape[1]}x{shape[0]} {shape[2]}-channel"
     if len(shape) == 2:
@@ -164,63 +141,55 @@ def describe_shape(shape: tuple) -> str:
 
 
 class _Attempt:
-    """One (index, backend, strategy) trial and why it did or did not work."""
+    """One (device, path, layout) trial and why it did or did not work."""
 
-    __slots__ = ("index", "backend", "strategy", "reason", "convert_rgb",
-                 "shape", "thermal_geometry")
+    __slots__ = ("index", "backend", "strategy", "reason", "shape")
 
-    def __init__(self, index, backend, strategy, reason, convert_rgb=None,
-                 shape=None):
+    def __init__(self, index, backend, strategy, reason, shape=None):
         self.index = index
-        self.backend = _backend_name(backend)
+        self.backend = _backend_name(backend) if isinstance(backend, int) else str(backend)
         self.strategy = strategy
         self.reason = reason
-        self.convert_rgb = convert_rgb
         self.shape = shape
-        self.thermal_geometry = bool(shape) and has_thermal_geometry(shape)
+
+    @property
+    def thermal_geometry(self) -> bool:
+        return bool(self.shape) and has_thermal_geometry(self.shape)
 
     def __str__(self) -> str:
-        readback = ""
-        if self.convert_rgb is not None:
-            readback = f" [CONVERT_RGB reads back as {self.convert_rgb:g}]"
         where = f"index {self.index} / {self.backend}"
         if self.strategy:
             where += f" / {self.strategy}"
-        return f"{where}: {self.reason}{readback}"
+        return f"{where}: {self.reason}"
+
+
+def frame_rejection(dec: layouts.Decoded) -> Optional[str]:
+    """Why a decoded frame cannot be real thermal data (None if it can)."""
+    raw = dec.raw64
+    if float(np.mean((raw >> 8) == 0x80)) > 0.98 and int(raw.max() - raw.min()) < 256:
+        return "the 'temperatures' are the camera's 8-bit picture (all ~240 C)"
+    return decode.scene_rejection_reason(raw_to_celsius(raw))
 
 
 class ThermalCamera:
-    """A TC001-class thermal camera opened in raw radiometric mode.
+    """A TC001-class thermal camera delivering per-pixel temperatures.
 
     Parameters
     ----------
     index:
-        Camera index as OpenCV sees it. ``None`` scans for the first device
-        that yields decodable thermal frames -- slower to start, but it means
-        you do not have to hardcode an index that changes between machines.
+        Camera index (OpenCV numbering; N of /dev/videoN on Linux). ``None``
+        scans for the thermal camera.
     offset_c, gain:
-        Linear correction applied to every decoded frame, as
-        ``corrected = measured * gain + offset_c``.
+        Linear correction, ``corrected = measured * gain + offset_c``.
     swap_bytes:
-        ``None`` (default) auto-detects byte order from the first frame.
-    verbose:
-        Let OpenCV's own log messages through. Off by default.
+        Byte order of the classic layout's samples; ``None`` auto-detects.
     exclude:
-        Indices never to probe while scanning (``index=None``) -- e.g. the
-        ordinary camera that is already open elsewhere in the same program.
-        Probing a camera that is in use can disturb it on Windows.
+        Indices the scan must never touch (the ordinary camera in use).
     preferred:
-        ``(index, backend, strategy_name)`` that worked last time. Tried before
-        anything else, so a re-open takes one attempt instead of a full search.
+        ``(index, backend, layout_name)`` that worked last time; tried first.
     should_stop:
-        Callable checked between attempts; when it returns True, :meth:`open`
-        gives up promptly with :class:`OpenCancelled`.
-
-    Example
-    -------
-    >>> with ThermalCamera() as cam:
-    ...     frame = cam.read()
-    ...     print(frame.at(128, 96))
+        Callable checked between attempts; :meth:`open` then raises
+        :class:`OpenCancelled`.
     """
 
     def __init__(self, index: Optional[int] = None, *,
@@ -248,99 +217,94 @@ class ThermalCamera:
         self.preferred = preferred
         self.should_stop = should_stop
 
-        self._cap: Optional[cv2.VideoCapture] = None
+        self._cap = None
+        self._layout: Optional[Layout] = None
         self._resolved_index: Optional[int] = None
         self._resolved_backend: Optional[int] = None
-        self._resolved_strategy: Optional[str] = None
+        self._ref: Optional[DeviceRef] = None
         self.attempts: list[_Attempt] = []
         self.devices: list = []
+        self.modes: dict = {}
 
     # --- Lifecycle -----------------------------------------------------------
 
     def open(self) -> "ThermalCamera":
-        """Open the device and verify it delivers raw thermal frames."""
+        """Find the camera, pick its best mode and verify it delivers
+        plausible temperatures. Raises ThermalCameraError with a diagnosis."""
         if self._cap is not None:
             return self
-
         set_opencv_log_level(self.verbose)
-
-        # Ask the OS what is actually attached. Two reasons this matters:
-        # picking a device by name is stable across replugs where an index is
-        # not, and the cheap "does this index open" probe below produces false
-        # negatives on some Windows setups -- a device the OS lists must never
-        # be skipped on the strength of that probe alone.
         try:
-            self.devices = list_video_devices()
-        except Exception:                                  # never fatal
+            self.devices = list_video_devices(include_pnp=False)
+        except Exception:
             self.devices = []
+        refs = {r.index: r for r in device_refs(self.devices)}
+
         index = self.index
         if index is None and self.name:
-            index = find_by_name(self.name)
+            low = self.name.lower()
+            index = next((r.index for r in refs.values() if low in r.name.lower()), None)
             if index is None:
-                listing = "\n".join(f"  - {d}" for d in self.devices) or "  (none)"
-                raise ThermalCameraError(
-                    f"No video device matched name {self.name!r}.\n"
-                    f"Devices the system reports:\n{listing}")
+                raise ThermalCameraError(f"No video device matched name {self.name!r}.")
 
         if index is not None:
-            indices = [index]
+            candidates = [index]
         else:
-            available = [device for device in self.devices
-                         if device.index is not None and device.index not in self.exclude]
-            thermal = [device.index for device in available if device.looks_thermal]
-            unknown = [device.index for device in available
-                       if not device.looks_thermal and "webcam" not in device.name.lower()]
-            webcams = [device.index for device in available
-                       if not device.looks_thermal and "webcam" in device.name.lower()]
-            indices = thermal + unknown + webcams
-            if not indices and not self.devices:
-                indices = [i for i in range(self.max_scan_index) if i not in self.exclude]
-        backends = [self.backend] if self.backend is not None \
-            else _platform_backends()
-        strategies = [s for s in STRATEGIES
-                      if self.strategy is None or s.name == self.strategy]
-        if not strategies:
-            raise ValueError(f"Unknown strategy {self.strategy!r}. "
-                             f"Available: {[s.name for s in STRATEGIES]}")
-
-        # What worked last time goes first: a reconnect then costs one open
-        # instead of a search through every backend/strategy (on Windows the
-        # DirectShow attempts alone take several seconds, and all of them fail
-        # for this camera because DSHOW converts its stream).
-        plan = []
-        if self.preferred is not None:
-            p_index, p_backend, p_strategy = self.preferred
-            strat = next((s for s in _strategies_for(p_backend, strategies)
-                          if s.name == p_strategy), None)
-            if strat is not None and p_index in indices and p_backend in backends:
-                plan.append((p_index, p_backend, [strat], True))
-        for idx in indices:
-            for backend in backends:
-                plan.append((idx, backend, _strategies_for(backend, strategies), False))
+            available = [r for r in refs.values() if r.index not in self.exclude]
+            look = {d.index: d for d in self.devices if d.index is not None}
+            thermal = [r.index for r in available if look[r.index].looks_thermal]
+            webcam = [r.index for r in available
+                      if r.index not in thermal and "webcam" in r.name.lower()]
+            other = [r.index for r in available if r.index not in thermal + webcam]
+            candidates = thermal + other + webcam
+            if not candidates and not refs:
+                candidates = [i for i in range(self.max_scan_index) if i not in self.exclude]
 
         self.attempts = []
-        tried = set()
-        for idx, backend, strats, is_preferred in plan:
-            for strat in strats:
-                key = (idx, backend, strat.name)
-                if key in tried:
-                    continue
-                tried.add(key)
-                self._check_stop()
-                cap, present = self._try_configuration(idx, backend, strat)
-                if cap is not None:
-                    self._cap = cap
-                    self._resolved_index = idx
-                    self._resolved_backend = backend
-                    self._resolved_strategy = strat.name
-                    log.info("Opened thermal camera: index %d, %s, strategy %s",
-                             idx, _backend_name(backend), strat.name)
-                    return self
-                if not present and not is_preferred:
-                    # Nothing here at all -- no point trying four more
-                    # property orderings against a device that will not open.
-                    break
+        plans = []
+        for idx in candidates:
+            self._check_stop()
+            ref = refs.get(idx)
+            if ref is None and sys.platform.startswith("linux"):
+                ref = DeviceRef(index=idx, name=f"/dev/video{idx}", path=f"/dev/video{idx}")
+            modes = list_modes(ref) if ref is not None else []
+            self.modes[idx] = modes
+            sizes = [m.size for m in modes]
+            if modes and not layouts.is_thermal_mode_list(sizes):
+                self.attempts.append(_Attempt(idx, "-", None,
+                                              "not a thermal camera (offers "
+                                              + ", ".join(sorted({m.size for m in modes})[:4]) + ")"))
+                continue
+            offered = layouts.layout_for_modes(sizes) if modes else [CLASSIC_384, GRAY_392]
+            if modes and not offered:
+                offered = [CLASSIC_384]       # 256 wide, unknown variant: try the classic one
+            for lay in offered:
+                if ref is not None and shutil_ffmpeg():
+                    plans.append((idx, ref, CAP_FFMPEG_RAW, lay))
+            for lay in offered:
+                for be in _platform_backends():
+                    if self.backend is None or self.backend == be:
+                        plans.append((idx, ref, be, lay))
+        if self.backend is not None:
+            plans = [p for p in plans if p[2] == self.backend] or plans
 
+        if self.preferred is not None:
+            p_idx, p_be, p_lay = self.preferred
+            pref = [p for p in plans if (p[0], p[2], p[3].name) == (p_idx, p_be, p_lay)]
+            plans = pref + [p for p in plans if p not in pref]
+
+        for idx, ref, be, lay in plans:
+            self._check_stop()
+            if be == CAP_FFMPEG_RAW:
+                ok = self._try_ffmpeg(idx, ref, lay)
+            else:
+                ok = self._try_opencv(idx, ref, be, lay)
+            if ok:
+                self._resolved_index, self._resolved_backend = idx, be
+                self._layout, self._ref = lay, ref
+                log.info("Opened thermal camera: index %s, %s, layout %s", idx,
+                         _backend_name(be), lay.name)
+                return self
         self._check_stop()
         raise ThermalCameraError(self._diagnosis())
 
@@ -350,184 +314,143 @@ class ThermalCamera:
 
     @property
     def resolved(self) -> Optional[tuple]:
-        """``(index, backend, strategy)`` actually in use, for ``preferred=``."""
+        """``(index, backend, layout_name)`` actually in use, for ``preferred=``."""
         if self._cap is None:
             return None
-        return (self._resolved_index, self._resolved_backend, self._resolved_strategy)
+        return (self._resolved_index, self._resolved_backend, self._layout.name)
 
-    def _try_configuration(self, index: int, backend: int, strat: Strategy
-                           ) -> tuple[Optional[cv2.VideoCapture], bool]:
-        """Open, apply one strategy, and accept only if frames decode.
+    @property
+    def layout(self) -> Optional[Layout]:
+        return self._layout
 
-        Returns ``(capture_or_None, device_was_present)``. The second value lets
-        the caller distinguish "this ordering did not work" from "there is no
-        camera here", and stop early in the latter case.
+    # --- capture paths -----------------------------------------------------------
 
-        There is deliberately no separate existence check before this. Probing
-        an index by opening and immediately closing it, then opening it again a
-        moment later, is a good way to make a perfectly working camera look
-        absent on Windows -- the handle is not released synchronously, so the
-        second open can fail on a device that is genuinely there. Opening once
-        and keeping the handle avoids that window entirely.
-
-        The device is still re-opened between *strategies*, because backend
-        property state is sticky and a failed attempt would poison the next one.
-        """
-        # Retry once. Windows does not free a capture handle synchronously, so
-        # an open issued shortly after the same device was released can fail on
-        # a camera that is perfectly present -- which then looks identical to
-        # "not plugged in". One short retry removes that false negative.
-        if backend == CAP_FFMPEG_RAW:
-            cap = FFmpegRawCapture(index)
-            if not cap.isOpened():
-                self.attempts.append(_Attempt(index, backend, strat.name,
-                                              f"ffmpeg: {cap.error}"[:160]))
-                return None, True
-        else:
-            cap = cv2.VideoCapture(index, backend)
-            if not cap.isOpened():
-                cap.release()
-                time.sleep(RELEASE_SETTLE_S * 4)
-                cap = cv2.VideoCapture(index, backend)
-
-        if not cap.isOpened():
-            cap.release()
-            time.sleep(RELEASE_SETTLE_S)
-            self.attempts.append(_Attempt(index, backend, None, "no device here"))
-            return None, False
-
-        try:
-            # Nothing may touch the capture before or after this call: on DSHOW
-            # any property set after CAP_PROP_CONVERT_RGB reverts it. Each
-            # strategy owns its own full ordering, buffer size included.
-            strat.apply(cap, SENSOR_WIDTH, FRAME_HEIGHT, DEFAULT_FPS)
-        except cv2.error as exc:
-            cap.release()
-            self.attempts.append(
-                _Attempt(index, backend, strat.name, f"property error: {exc}"))
-            return None, True
-
-        readback = convert_rgb_readback(cap)
-        reason, seen_shape = "no frames arrived", None
-
+    def _accept_first_frames(self, cap, idx, backend, lay: Layout, convert,
+                             swap_hint: Optional[bool] = None) -> bool:
+        """Read frames until one decodes and validates (or time runs out)."""
+        reason, shape = "no frames arrived", None
+        deadline = time.time() + OPEN_FRAME_TIMEOUT_S
         for _ in range(SETTLE_FRAMES):
             if self.should_stop is not None and self.should_stop():
                 cap.release()
                 raise OpenCancelled("thermal camera open cancelled")
-            ok, raw_frame = cap.read()
-            if not ok or raw_frame is None:
+            if time.time() > deadline:
+                break
+            t0 = time.time()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                if time.time() - t0 > 3.0:
+                    reason = "reads time out (device busy?)"
+                    break
                 continue
-            seen_shape = tuple(raw_frame.shape)
+            shape = tuple(frame.shape)
             try:
-                buffer = normalize_buffer(raw_frame)
-            except FrameLayoutError as exc:
-                reason = str(exc).split("\n")[0]
+                flat = convert(frame)
+                swap = self.swap_bytes if self.swap_bytes is not None else swap_hint
+                if swap is None and lay is CLASSIC_384:
+                    swap = self._detect_swap(flat)
+                dec = lay.decode(flat, swap_bytes=bool(swap))
+            except (LayoutError, FrameLayoutError) as exc:
+                reason = str(exc).split("\n")[0][:160]
                 continue
-
-            _, thermal = split_halves(buffer)
-            swap = self.swap_bytes
-            if swap is None:
-                swap = detect_byte_order(thermal)
-            celsius = raw_to_celsius(raw_from_thermal(thermal, swap_bytes=swap))
-
-            # An ordinary webcam's bytes also arrive as a decodable buffer, so
-            # shape proves nothing -- the values have to survive a strict check
-            # before this device is accepted. Handing back a camera that reports
-            # confident nonsense is worse than failing to open one.
-            rejection = decode.scene_rejection_reason(celsius)
+            rejection = frame_rejection(dec)
             if rejection is not None:
                 reason = f"not a thermal scene: {rejection}"
                 continue
-
-            self.swap_bytes = swap
-            return cap, True
-
+            self.swap_bytes = bool(swap)
+            self._cap = cap
+            return True
         cap.release()
         time.sleep(RELEASE_SETTLE_S)
-        self.attempts.append(_Attempt(index, backend, strat.name, reason,
-                                      readback, seen_shape))
-        return None, True
+        self.attempts.append(_Attempt(idx, backend, lay.name, reason, shape))
+        return False
+
+    @staticmethod
+    def _detect_swap(flat: np.ndarray) -> bool:
+        frame = flat[:CLASSIC_384.frame_bytes].reshape(384, 256, 2)
+        top, bottom = frame[:192], frame[192:]
+        thermal = top if layouts.looks_like_picture(bottom) and not layouts.looks_like_picture(top) else bottom
+        return decode.detect_byte_order(thermal)
+
+    def _try_ffmpeg(self, idx, ref: DeviceRef, lay: Layout) -> bool:
+        formats = ["yuyv422", "uyvy422"] if sys.platform == "darwin" else ["yuyv422"]
+        for pix in formats:
+            cap = FFmpegRawCapture(ref, lay.width, lay.height, pixel_format=pix, fps=DEFAULT_FPS)
+            if not cap.isOpened():
+                self.attempts.append(_Attempt(idx, CAP_FFMPEG_RAW, lay.name,
+                                              f"ffmpeg: {cap.error}"[:200]))
+                time.sleep(RELEASE_SETTLE_S)
+                continue
+            # UYVY: every 16-bit sample arrives byte-swapped
+            hint = True if (pix == "uyvy422" and lay is not CLASSIC_384) else None
+            if self._accept_first_frames(cap, idx, CAP_FFMPEG_RAW, lay, lambda f: f, hint):
+                return True
+        return False
+
+    def _try_opencv(self, idx, ref, backend, lay: Layout) -> bool:
+        src = ref.path if (ref is not None and ref.path and backend == cv2.CAP_V4L2) else idx
+        cap = cv2.VideoCapture(src, backend)
+        if not cap.isOpened():
+            cap.release()
+            time.sleep(RELEASE_SETTLE_S)
+            cap = cv2.VideoCapture(src, backend)
+        if not cap.isOpened():
+            cap.release()
+            self.attempts.append(_Attempt(idx, backend, None, "would not open"))
+            return False
+        try:
+            STRATEGIES[0].apply(cap, lay.width, lay.height, DEFAULT_FPS)
+        except cv2.error as exc:
+            cap.release()
+            self.attempts.append(_Attempt(idx, backend, lay.name, f"property error: {exc}"))
+            return False
+        return self._accept_first_frames(cap, idx, backend, lay,
+                                         lambda f: self._to_flat(f, lay))
+
+    @staticmethod
+    def _to_flat(frame: np.ndarray, lay: Layout) -> np.ndarray:
+        """OpenCV frames come in several shapes; give the decoder raw bytes."""
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            raise FrameLayoutError(f"converted frame {frame.shape}: the backend destroyed the raw data")
+        flat = layouts.as_bytes(frame)
+        if flat.size == lay.frame_bytes:
+            return flat
+        if lay is CLASSIC_384:
+            return layouts.as_bytes(normalize_buffer(frame))
+        raise FrameLayoutError(f"frame has {flat.size} bytes, {lay.name} needs {lay.frame_bytes}")
 
     def _diagnosis(self) -> str:
-        """Build an error message that says what to actually do next."""
-        lines = ["Could not open a TC001-class thermal camera in raw mode.", ""]
-
+        lines = ["Could not open a TC001-class thermal camera.", ""]
         if self.devices:
-            lines.append("Video devices the system reports:")
-            lines.extend(f"  {d}" + ("   <-- looks like the thermal camera"
-                                     if d.looks_thermal else "")
-                         for d in self.devices)
+            lines.append("Cameras the system reports:")
+            for d in self.devices:
+                modes = self.modes.get(d.index) or []
+                tail = (" -- modes: " + ", ".join(sorted({m.size for m in modes})[:6])) if modes else ""
+                lines.append(f"  {d}{tail}")
             lines.append("")
+        if not shutil_ffmpeg():
+            lines += ["FFmpeg is not installed (or not on PATH); it is the main capture path.",
+                      ""]
+        if self.attempts:
+            lines.append("Tried:")
+            lines.extend(f"  - {a}" for a in self.attempts[:20])
+            lines.append("")
+        if not any("not a thermal camera" not in a.reason for a in self.attempts):
+            lines += ["No camera offered the thermal camera's modes (256-px-wide frames).",
+                      "Check the cable (many USB-C cables are charge-only), plug it straight",
+                      "into the computer, and close other programs that use cameras."]
         else:
-            lines += [
-                "Could not enumerate device names. On Windows, installing "
-                "pygrabber makes this diagnosis far more precise:",
-                "    pip install pygrabber",
-                "",
-            ]
-
-        real = [a for a in self.attempts if a.reason != "no device here"]
-        if not real:
-            lines.append("No camera devices responded at any index.")
-            lines.append("Check the cable and that the camera's blue LED is lit.")
-            return "\n".join(lines)
-
-        lines.append("Tried:")
-        lines.extend(f"  - {a}" for a in real[:24])
-        if len(real) > 24:
-            lines.append(f"  ... and {len(real) - 24} more")
-        lines.append("")
-
-        converted = [a for a in real if "converted frame" in a.reason]
-        thermal_sized = [a for a in converted if a.thermal_geometry]
-
-        if thermal_sized:
-            # A 256x384 stream that came back as BGR: the camera is definitely
-            # there, and something in the capture path is converting it.
-            lines += [
-                "The thermal camera IS present and streaming at 256x384, but "
-                "every capture path converted the frame to BGR, which destroys "
-                "the radiometric data.",
-                "",
-                "In order of likelihood:",
-                "  1. The TOPDON PC software is installed. Uninstall it completely "
-                "-- its driver replaces the generic UVC one and blocks raw capture.",
-                "  2. Another program has the camera open (Camera app, Teams, OBS, "
-                "Zoom). Close it and retry.",
-                f"  3. This OpenCV build converts on every backend. You are on "
-                f"OpenCV {cv2.__version__}. Try:  "
-                f"pip install \"opencv-python>=4.8,<5\"",
-            ]
-        elif converted:
-            # Everything that responded was some other camera.
-            sizes = sorted({describe_shape(a.shape) for a in converted if a.shape})
-            lines += [
-                "No thermal camera was found. The device(s) that responded are "
-                "ordinary cameras -- most likely a built-in webcam.",
-                f"  Saw: {', '.join(sizes)}   (the TC001 streams 256x384)",
-                "",
-                "So the thermal camera is not reaching Windows as a UVC device:",
-                "  1. Check the cable. Many USB-C cables are charge-only. Use the "
-                "one that came with the camera, straight into the machine, not "
-                "through a hub or dock.",
-                "  2. Open Device Manager and look under Cameras / Imaging devices "
-                "while plugging it in. If nothing appears, it is a cable, port or "
-                "power problem, not a software one.",
-                "  3. If it appears with a warning triangle, the TOPDON driver is "
-                "installed. Uninstall the TOPDON PC software completely.",
-                "  4. Settings > Privacy & security > Camera: 'Let desktop apps "
-                "access your camera' must be on.",
-            ]
-        else:
-            lines += [
-                "Devices responded but none produced decodable thermal frames.",
-                "Run with --debug to see the raw frame shapes each backend returned.",
-            ]
+            lines += ["The thermal camera was found but no capture path gave valid frames.",
+                      "Close other programs that may hold it (TOPDON software, Camera app,",
+                      "Teams, OBS), unplug and replug it, and try again."]
         return "\n".join(lines)
 
     def close(self) -> None:
         if self._cap is not None:
-            self._cap.release()
+            try:
+                self._cap.release()
+            except Exception:
+                pass
             self._cap = None
 
     def __enter__(self) -> "ThermalCamera":
@@ -546,31 +469,21 @@ class ThermalCamera:
         """Grab and decode the next frame. Raises if the device drops out."""
         if self._cap is None:
             self.open()
-        assert self._cap is not None
-
-        ok, raw_frame = self._cap.read()
-        if not ok or raw_frame is None:
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            err = getattr(self._cap, "error", "")
             raise ThermalCameraError(
-                "Lost the camera stream. It was probably unplugged, or another "
-                "program took the device."
-            )
-
-        buffer = normalize_buffer(raw_frame)
-        visual, thermal = split_halves(buffer)
-        return ThermalFrame(
-            raw=raw_from_thermal(thermal, swap_bytes=bool(self.swap_bytes)),
-            gray=visual_to_gray(visual),
-            offset_c=self.offset_c,
-            gain=self.gain,
-        )
+                "Lost the camera stream (unplugged, or another program took the device)"
+                + (f": {err}" if err else "."))
+        try:
+            flat = frame if self._resolved_backend == CAP_FFMPEG_RAW else self._to_flat(frame, self._layout)
+            dec = self._layout.decode(flat, swap_bytes=bool(self.swap_bytes))
+        except (LayoutError, FrameLayoutError) as exc:
+            raise ThermalCameraError(f"bad frame: {exc}") from exc
+        return ThermalFrame(raw=dec.raw64, gray=dec.gray, offset_c=self.offset_c,
+                            gain=self.gain, approximate=dec.approximate)
 
     def frames(self) -> Iterator[ThermalFrame]:
-        """Yield frames until the stream ends or you break out.
-
-        >>> for frame in cam.frames():
-        ...     if frame.hottest.celsius > 60:
-        ...         break
-        """
         while True:
             try:
                 yield self.read()
@@ -583,17 +496,20 @@ class ThermalCamera:
         """What actually got negotiated -- useful when debugging a new machine."""
         if self._cap is None:
             return {"open": False}
-        fourcc = (int.from_bytes(b"YUYV", "little") if self._resolved_backend == CAP_FFMPEG_RAW
-                  else int(self._cap.get(cv2.CAP_PROP_FOURCC)))
+        lay = self._layout
         return {
             "open": True,
             "index": self._resolved_index,
-            "backend": _backend_name(self._resolved_backend or cv2.CAP_ANY),
-            "strategy": self._resolved_strategy,
-            "fourcc": "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)),
-            "width": int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            "height": int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-            "fps": self._cap.get(cv2.CAP_PROP_FPS),
+            "name": self._ref.name if self._ref else "",
+            "backend": _backend_name(self._resolved_backend),
+            "strategy": lay.name,
+            "layout": lay.name,
+            "mode": lay.size,
+            "approximate": lay.approximate,
+            "temp_divisor": layouts.TEMP_MODE_DIVISOR if lay is not CLASSIC_384 else 64.0,
+            "width": SENSOR_WIDTH,
+            "height": SENSOR_HEIGHT,
+            "fps": DEFAULT_FPS,
             "swap_bytes": self.swap_bytes,
             "offset_c": self.offset_c,
             "gain": self.gain,
@@ -602,67 +518,40 @@ class ThermalCamera:
         }
 
 
-def find_cameras(max_index: int = 10, verbose: bool = False) -> list[dict]:
-    """Probe indices and report which ones are usable thermal cameras.
+def shutil_ffmpeg() -> bool:
+    import shutil
+    return shutil.which("ffmpeg") is not None
 
-    Returns one dict per index that responded, each with ``thermal: bool``.
-    Unlike a bare index scan this actually tries every backend and strategy, so
-    a "not thermal" verdict here means the data really could not be recovered.
+
+def find_cameras(max_index: int = 10, verbose: bool = False) -> list[dict]:
+    """Report which cameras are usable thermal cameras.
+
+    Returns one dict per camera, each with ``thermal: bool``.
     """
     set_opencv_log_level(verbose)
     results = []
-
-    # Names, where the OS will tell us. Index alone cannot distinguish a
-    # built-in webcam from a thermal camera, and with several attached the
-    # numbering shifts between reboots.
     try:
-        named_devices = {d.index: d for d in list_video_devices()
-                         if d.index is not None}
+        devices = list_video_devices(include_pnp=False)
     except Exception:
-        named_devices = {}
-    named = {index: device.name for index, device in named_devices.items()}
-
-    if named_devices:
-        thermal_indices = [i for i, device in named_devices.items()
-                           if device.looks_thermal]
-        unknown_indices = [i for i, device in named_devices.items()
-                           if not device.looks_thermal and "webcam" not in device.name.lower()]
-        webcam_indices = [i for i, device in named_devices.items()
-                          if not device.looks_thermal and "webcam" in device.name.lower()]
-        indices = thermal_indices + unknown_indices + webcam_indices
-    else:
-        indices = list(range(max_index))
-
+        devices = []
+    indices = [d.index for d in devices if d.index is not None] or list(range(max_index))
+    names = {d.index: d.name for d in devices}
     for index in indices:
-        entry = {"index": index, "name": named.get(index, ""),
-                 "backend": "-", "strategy": "-",
-                 "thermal": False, "note": "responded, but not a thermal camera"}
-
-        # Let ThermalCamera try every backend and strategy for this index.
-        cam = ThermalCamera(index=index, max_scan_index=max_index, verbose=verbose)
+        entry = {"index": index, "name": names.get(index, ""), "backend": "-",
+                 "strategy": "-", "thermal": False, "note": ""}
+        cam = ThermalCamera(index=index, verbose=verbose)
         try:
             cam.open()
             info = cam.info()
-            entry.update(thermal=True, backend=info["backend"],
-                         strategy=info["strategy"],
-                         note=f"decodes OK (swap_bytes={cam.swap_bytes})")
+            entry.update(thermal=True, backend=info["backend"], strategy=info["layout"],
+                         note=f"decodes OK ({info['mode']}"
+                              + (", approximate" if info["approximate"] else "") + ")")
         except ThermalCameraError:
-            real = [a for a in cam.attempts if a.reason != "no device here"]
+            real = [a for a in cam.attempts if a.reason != "would not open"]
             if not real:
-                continue                      # nothing at this index at all
-            entry["backend"] = real[0].backend
-            shapes = {describe_shape(a.shape) for a in real if a.shape}
-            seen = f" [{', '.join(sorted(shapes))}]" if shapes else ""
-            if any(a.thermal_geometry for a in real):
-                # 256x384 but unusable: the thermal camera, being converted.
-                entry["note"] = f"thermal camera, but converted to BGR{seen}"
-            elif any("converted frame" in a.reason for a in real):
-                # Some other camera entirely -- almost always the webcam.
-                entry["note"] = f"ordinary camera, not thermal{seen}"
-            else:
-                entry["note"] = real[0].reason[:60] + seen
+                continue
+            entry["note"] = real[0].reason[:70]
         finally:
             cam.close()
-
         results.append(entry)
     return results

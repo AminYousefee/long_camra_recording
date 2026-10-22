@@ -42,6 +42,9 @@ class ThermalFrame:
     gray: np.ndarray
     offset_c: float = 0.0
     gain: float = 1.0
+    #: True when per-pixel values were fitted from the camera's frame
+    #: statistics rather than read from its temperature data.
+    approximate: bool = False
     _celsius: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
     # --- Temperature data ----------------------------------------------------

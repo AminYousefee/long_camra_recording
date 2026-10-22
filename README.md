@@ -23,7 +23,7 @@ The same modes and settings as the thermalcam viewer:
 
 | Setting | What it does |
 |---|---|
-| Palette | inferno, gray, jet, hot, magma, plasma, viridis, bone, rainbow, turbo |
+| Palette | gray (default), inferno, jet, hot, magma, plasma, viridis, bone, rainbow, turbo |
 | Span mode | **Auto** (per-frame min/max), **Manual** (fixed °C window — a temperature is always the same colour), **Percentile** (per-frame, ignores hot/cold specks) |
 | Span °C / Percentile % | the two bounds, applied with SET or Enter |
 | Correction | **Off**, **Offset / gain** (`corrected = measured × gain + offset`), **Reference points** |
@@ -106,9 +106,9 @@ On Windows and macOS, FFmpeg opens the camera itself for recording and cannot se
 | Feature | Linux | Windows | macOS |
 |---|---|---|---|
 | Camera preview, photos, time-lapse | V4L2 | DirectShow (Media Foundation fallback) | AVFoundation |
-| Camera recording (FFmpeg) | `v4l2`, MJPEG | `dshow`, MJPEG at the chosen size (falls back to the default mode) | `avfoundation` |
+| Camera recording (FFmpeg) | `v4l2` | `dshow` | `avfoundation` — on every OS in a mode the camera really offers (see *Recording reliability*) |
 | GPU encoder | `h264_vaapi` | `h264_qsv` (Intel) | `h264_videotoolbox` |
-| Thermal camera (raw temperatures) | OpenCV V4L2, FFmpeg fallback | Media Foundation, FFmpeg fallback | FFmpeg (OpenCV's macOS backend cannot give raw frames) |
+| Thermal camera (raw temperatures) | FFmpeg, OpenCV V4L2 fallback | FFmpeg, Media Foundation fallback | FFmpeg |
 | Exposure / WB / focus | `v4l2-ctl` or OpenCV | OpenCV (DirectShow) | OpenCV — most Mac camera drivers expose none of these, so READ may show nothing |
 | Keep awake while capturing | `systemd-inhibit` | `SetThreadExecutionState` | `caffeinate` |
 | Launch at login | `~/.config/autostart` | Startup folder `.cmd` | `~/Library/LaunchAgents` |
@@ -128,11 +128,28 @@ On Windows and macOS, FFmpeg opens the camera itself for recording and cannot se
 2. The first time, macOS asks for camera access for the app that runs Python (Terminal, iTerm, VS Code…). Allow it; if you missed the prompt: *System Settings → Privacy & Security → Camera*.
 3. Run `python3 amin_studio.py`. Right-click (or Ctrl-click) removes a thermal reference point.
 
+### Recording reliability
+
+- Before recording, the app asks the camera which modes it has and records in the one that matches the chosen resolution (MJPEG preferred). A camera without that resolution is recorded at its largest mode of the same shape, and the alert says so, instead of FFmpeg exiting at once.
+- A GPU encoder (`h264_qsv`, `h264_vaapi`, `h264_videotoolbox`) is tested with a few frames first; if it does not work on this machine the recording uses `libx264` and says so.
+- Recordings are H.264 4:2:0 (`yuv420p`), which plays everywhere. (MJPEG cameras deliver 4:2:2, which used to produce H.264 4:2:2 files that Windows Media Player and most phones cannot play.)
+- If the camera FFmpeg stops, the reason is read from `logs/ffmpeg_camera.log` and shown: a busy device is retried after 3 s, a refused mode falls back to the camera's default mode, a failing encoder switches to `libx264`, anything else is retried after 2, 4, 8 … 60 s. The thermal recording continues meanwhile.
+
+### Testing
+
+| What | How | Needs |
+|---|---|---|
+| Unit + recording tests | `python -m unittest discover -s tests -v` (Windows: `tests\run_unit_tests.cmd`) | FFmpeg, no cameras (a fake thermal camera and test patterns are used) |
+| Hardware self-test | close Amin Studio, then `python tests/hw_selftest.py` (Windows: double-click `tests\run_selftest.cmd`) | both cameras; ~2.5 min |
+| Hardware diagnosis | `python tests/hw_diagnose.py` | prints every camera's modes, encoder support and the raw thermal layout |
+
+The self-test finds the cameras, checks the thermal frame rate and that the values are temperatures, takes two photo pairs, records camera + thermal across a chunk boundary while killing the camera FFmpeg once on purpose, and checks every file with `ffprobe`. Results: `hwtest_output/selftest_<time>/report.txt`.
+
 ### Unattended runs: log, sleep, crash and reboot
 
 - **Log**: everything that happens goes to `<save path>/logs/studio.log`, a new file every midnight: starts/stops, locked exposure values, every thermal-setting change, camera dropouts and reconnects, encoder restarts, skipped or failed shots, low-disk stops, and every warning shown on screen. FFmpeg's own messages go to `logs/ffmpeg_camera.log` and `logs/ffmpeg_thermal_*.log`. Before a capture starts, the log is in `~/.config/amin_studio/logs/`.
 - **No sleep**: while capturing, the app blocks suspend, idle-sleep and lid-close sleep (via `systemd-inhibit` on Linux, `SetThreadExecutionState` on Windows, `caffeinate` on macOS). To be safe, also turn off automatic sleep in the system's power settings.
-- **Crash recovery**: if the camera FFmpeg dies, only it is restarted. The thermal recording continues uninterrupted.
+- **Crash recovery**: if the camera FFmpeg dies, only it is restarted (see *Recording reliability*). The thermal recording continues uninterrupted. A thermal encoder that keeps failing is retried with a growing delay, never once per frame.
 - **Resume**: with *Resume unfinished capture on launch* ticked (default), a capture that ended because the app crashed or the machine rebooted restarts automatically 20 s after the app opens (ESC cancels). If the camera isn't there yet (e.g. just after a reboot) it rescans and waits up to about a minute. The log records when the interrupted run started and when it resumed, so the gap is visible. A capture you stop yourself, or end by closing the window, is not resumed.
 - **Launch at login**: starts the app automatically when you log in (Linux: `~/.config/autostart`; Windows: a `.cmd` in the Startup folder). Combined with automatic login in Ubuntu's user settings, a time-lapse survives a power cut or reboot with no one at the machine.
 
@@ -154,8 +171,11 @@ The thermal camera stays on during a time-lapse (it needs a few minutes of warm-
 Shortcuts are ignored while typing in a field; ESC leaves the field.
 
 ### Thermal camera notes
-- On Windows the TC001 usually shows up only as **"USB Camera"**. The device scan opens such cameras briefly and recognises the thermal one by its 256-px-wide frame, so it is labelled `| THERMAL` and never picked as the normal camera. If the normal camera is ever pointed at it anyway, the app switches the normal camera to the other device.
-- The first time, finding the right capture mode takes a few seconds (DirectShow converts this camera's stream, so the app falls through to Media Foundation). The mode that worked is saved in `settings.json`, so later starts open the thermal camera in one attempt.
+- **Two TC001 revisions exist and they stream differently.** The original one offers a 256×384 mode (picture on top, Kelvin×64 below). The newer one has no 256×384 mode: it defaults to 256×392 (raw sensor counts, info lines, picture) and has a temperature-only mode the driver calls `4x12305`. The app reads the camera's mode list and uses the best layout it offers — the temperature mode on the newer camera. (Older versions of this app read the newer camera's *picture* as temperature, which gave ~240 °C everywhere; files from those runs do not contain temperatures.)
+- The newer revision's temperature unit is taken as Kelvin×16 (the InfiRay convention). **It has not been checked against a reference yet**: point the camera at your palm (~33 °C) — or run `tests\run_thermal_unit_check.cmd` — and if it is wrong, set `"thermal_temp_divisor"` in `~/.config/amin_studio/settings.json`.
+- If only the 256×392 mode can be opened (some macOS setups), per-pixel temperatures are fitted from the camera's own min/max/average/centre numbers and the status line says **APPROX.**
+- On Windows the TC001 usually shows up only as **"UVC Camera"** / **"USB Camera"**. The device scan asks every camera for its modes (nothing is opened) and recognises the thermal one by its 256-px-wide modes, so it is labelled `| THERMAL` and never picked as the normal camera. If the normal camera is ever pointed at it anyway, the app switches the normal camera to the other device.
+- The thermal camera is read through FFmpeg, which opens the exact mode in about a second. (OpenCV's DirectShow converts this camera's stream, and Media Foundation reads can hang 10 s each — the `[ WARN ] cap_msmf ... can't grab frame` messages — when the camera was just used by another program.)
 - Uninstall any TOPDON PC software on machines where it exists; its driver blocks raw capture.
 - Your user must be in the `video` group (see below).
 - Accuracy is the sensor's (±2 °C or ±2 %) after warm-up; use reference points for better.
