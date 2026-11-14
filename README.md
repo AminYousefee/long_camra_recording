@@ -51,7 +51,7 @@ trackingWheel_2026-09-28_12-17-43_thermal_info.json   once per recording: format
 trackingWheel_2026-09-28_12-17-43_thermal_settings.csv once per recording: correction/span at start + every change
 ```
 
-The first chunk of a recording starts when you press start; every later one starts on a clock boundary. The camera chunk may be named a second or two later than the thermal one (the camera can only cut on a keyframe).
+The first chunk of a recording starts when you press start; every later one starts on a clock boundary. The camera can only cut on a keyframe, so its new chunk may start a second or two after the boundary (e.g. `12-30-01`); the thermal chunk is cut at that same moment and gets the same name, so camera and thermal files always come in pairs with identical names.
 
 The radiometric video is 256×192 `gray16le` holding the **uncorrected** sensor temperature: `sensor_°C = value / 64 − 273.15` (0 = no signal). The correction is kept separately in `_thermal_settings.csv` as polynomial coefficients, highest order first, so `corrected_°C = numpy.polyval(coeffs, sensor_°C)`. A calibration can therefore always be redone after the fact. Read a chunk with:
 
@@ -64,7 +64,7 @@ print(a.shape, a.min(), a.max())"
 
 Frame *n* of the raw video, frame *n* of the colour video and row *n* of `_thermal_frames.csv` are the same moment.
 
-If the thermal camera drops out mid-recording, frames marked *THERMAL SIGNAL LOST* (zeros in the raw file) are written so the timeline stays correct, and the camera is reconnected automatically.
+A thermal dropout of up to ~4 s is bridged with frames marked *THERMAL SIGNAL LOST* (zeros in the raw file, `valid = 0` in the CSV) so the timeline stays correct. A longer one stops both recordings (see *Recording reliability*).
 
 ### PHOTO tab — dual-camera time-lapse
 
@@ -133,7 +133,13 @@ On Windows and macOS, FFmpeg opens the camera itself for recording and cannot se
 - Before recording, the app asks the camera which modes it has and records in the one that matches the chosen resolution (MJPEG preferred). A camera without that resolution is recorded at its largest mode of the same shape, and the alert says so, instead of FFmpeg exiting at once.
 - A GPU encoder (`h264_qsv`, `h264_vaapi`, `h264_videotoolbox`) is tested with a few frames first; if it does not work on this machine the recording uses `libx264` and says so.
 - Recordings are H.264 4:2:0 (`yuv420p`), which plays everywhere. (MJPEG cameras deliver 4:2:2, which used to produce H.264 4:2:2 files that Windows Media Player and most phones cannot play.)
-- If the camera FFmpeg stops, the reason is read from `logs/ffmpeg_camera.log` and shown: a busy device is retried after 3 s, a refused mode falls back to the camera's default mode, a failing encoder switches to `libx264`, anything else is retried after 2, 4, 8 … 60 s. The thermal recording continues meanwhile.
+- **Camera and thermal are kept in strict sync.** They start together (the thermal file gets the camera file's time stamp) and, when either one has a problem, **both** stop at once and close their files. Then both are restarted together, automatically and for as long as it takes: at once, then after 2 s, 5 s, and every 10 s. Nothing is recorded while one of them is missing, so every camera file has a thermal file with the same name and the same time span. (To record with only one camera, switch the other off before starting.)
+- Problems that trigger this: the camera FFmpeg exits; the camera picture **freezes** (no new frame for 10 s — a USB stall leaves FFmpeg waiting forever without an error, so this is watched separately); the thermal picture is lost for more than 4 s; a thermal encoder dies; a file cannot be written.
+- Before each retry the app checks what it can without touching the cameras, and shows why it is waiting: *recording folder cannot be written* (e.g. a USB drive the system switched to read-only), *waiting for the thermal camera*, *camera unplugged* (Linux).
+- The reason for a stop is read from `logs/ffmpeg_camera.log` and shown; FFmpeg's exit code is translated (`exit code 226 (Read-only file system)`). A refused mode falls back to the camera's default mode, a failing encoder switches to `libx264`.
+- The camera file on disk is never more than ~1 s behind (Matroska clusters of 1 s, flushed), so a frozen FFmpeg that has to be killed loses at most the last second.
+- Linux: after a USB reset a camera can come back as a different `/dev/videoN` (even swapped with the other camera). Both cameras are followed by their `/dev/v4l/by-id` name, so the right device is reopened.
+- The status line shows *RECORDING PAUSED • RECOVERING* while waiting; the thermal line counts the interruptions of the run; every interruption and its cause is in `studio.log`.
 
 ### Testing
 
@@ -149,7 +155,8 @@ The self-test finds the cameras, checks the thermal frame rate and that the valu
 
 - **Log**: everything that happens goes to `<save path>/logs/studio.log`, a new file every midnight: starts/stops, locked exposure values, every thermal-setting change, camera dropouts and reconnects, encoder restarts, skipped or failed shots, low-disk stops, and every warning shown on screen. FFmpeg's own messages go to `logs/ffmpeg_camera.log` and `logs/ffmpeg_thermal_*.log`. Before a capture starts, the log is in `~/.config/amin_studio/logs/`.
 - **No sleep**: while capturing, the app blocks suspend, idle-sleep and lid-close sleep (via `systemd-inhibit` on Linux, `SetThreadExecutionState` on Windows, `caffeinate` on macOS). To be safe, also turn off automatic sleep in the system's power settings.
-- **Crash recovery**: if the camera FFmpeg dies, only it is restarted (see *Recording reliability*). The thermal recording continues uninterrupted. A thermal encoder that keeps failing is retried with a growing delay, never once per frame.
+- **Crash recovery**: if either camera or a file fails, both recordings are stopped and restarted together (see *Recording reliability*). The supervision runs on its own thread, so it keeps working even if the window is busy.
+- **Log on a failing drive**: if `<save path>/logs` cannot be written (drive read-only or unplugged), the log continues in `~/.config/amin_studio/logs/` and the terminal shows one short line about it (instead of a traceback for every log line), and it moves back by itself once the drive works again.
 - **Resume**: with *Resume unfinished capture on launch* ticked (default), a capture that ended because the app crashed or the machine rebooted restarts automatically 20 s after the app opens (ESC cancels). If the camera isn't there yet (e.g. just after a reboot) it rescans and waits up to about a minute. The log records when the interrupted run started and when it resumed, so the gap is visible. A capture you stop yourself, or end by closing the window, is not resumed.
 - **Launch at login**: starts the app automatically when you log in (Linux: `~/.config/autostart`; Windows: a `.cmd` in the Startup folder). Combined with automatic login in Ubuntu's user settings, a time-lapse survives a power cut or reboot with no one at the machine.
 

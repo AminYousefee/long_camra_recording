@@ -12,6 +12,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -43,42 +44,245 @@ SECONDS_PER_DAY = 86400
 STAMP_FMT = "%Y-%m-%d_%H-%M-%S"          # sortable, used in every file name
 
 
-def setup_logging(log_dir: str) -> str:
+#: Where logs go when the chosen log folder cannot be written (the recording
+#: drive turned read-only or was disconnected). Set by setup_logging().
+FALLBACK_LOG_DIR: Optional[str] = None
+
+_LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S%z")
+
+
+class _QuietRotatingHandler(logging.handlers.TimedRotatingFileHandler):
+    """A rotating file log that reports a failed write to its owner instead of
+    printing a full traceback to the terminal for every single log line."""
+
+    def handleError(self, record) -> None:   # noqa: N802 (logging API name)
+        self.failed = True
+        self.failed_why = str(sys.exc_info()[1] or "write failed")
+
+
+class ResilientFileHandler(logging.Handler):
+    """studio.log that keeps working when its drive dies.
+
+    Writes to `path`. When a write fails (read-only file system, drive
+    unplugged...) the record goes to `fallback_dir`/studio.log instead, and the
+    terminal gets ONE short line about it (repeated at most every 10 min),
+    not a traceback per log line. The main file is tried again on every
+    record, so logging returns there by itself once the drive works again.
+    """
+
+    NOTICE_EVERY_S = 600.0
+
+    def __init__(self, path: str, fallback_dir: Optional[str] = None) -> None:
+        super().__init__()
+        self.baseFilename = os.path.abspath(path)     # same attribute as FileHandler
+        self.fallback_dir = fallback_dir
+        self._primary = self._make(path)
+        self._fallback: Optional[_QuietRotatingHandler] = None
+        self._last_notice = 0.0
+        self.using_fallback = False
+
+    @staticmethod
+    def _make(path: str) -> _QuietRotatingHandler:
+        h = _QuietRotatingHandler(path, when="midnight", backupCount=120, encoding="utf-8",
+                                  delay=True)
+        h.setFormatter(_LOG_FORMAT)
+        h.failed = False
+        return h
+
+    def emit(self, record) -> None:
+        p = self._primary
+        p.failed = False
+        p.emit(record)
+        if not p.failed:
+            if self.using_fallback:
+                self.using_fallback = False
+                self._notice(f"studio log: {self.baseFilename} works again")
+            return
+        if p.stream is not None:            # drop the broken handle, reopen next time
+            try:
+                p.stream.close()
+            except Exception:
+                pass
+            p.stream = None
+        self.using_fallback = True
+        where = self._emit_fallback(record)
+        self._notice(f"studio log: cannot write {self.baseFilename} ({p.failed_why}); "
+                     + (f"logging to {where}" if where else "log lines are being lost"))
+
+    def _emit_fallback(self, record) -> Optional[str]:
+        if not self.fallback_dir:
+            return None
+        try:
+            if self._fallback is None:
+                os.makedirs(self.fallback_dir, exist_ok=True)
+                path = os.path.join(self.fallback_dir, "studio.log")
+                if os.path.abspath(path) == self.baseFilename:
+                    return None
+                self._fallback = self._make(path)
+            self._fallback.failed = False
+            self._fallback.emit(record)
+            return None if self._fallback.failed else self._fallback.baseFilename
+        except Exception:
+            return None
+
+    def _notice(self, text: str) -> None:
+        now = time.time()
+        if now - self._last_notice < self.NOTICE_EVERY_S and "works again" not in text:
+            return
+        self._last_notice = now
+        try:
+            sys.stderr.write(datetime.now().strftime("%H:%M:%S ") + text + "\n")
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        for h in (self._primary, self._fallback):
+            if h is not None:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+        super().close()
+
+
+def setup_logging(log_dir: str, fallback_dir: Optional[str] = None) -> str:
     """(Re)point the 'studio' log at <log_dir>/studio.log, rotated at midnight.
 
-    Returns the log file path. Safe to call repeatedly (e.g. when the save
-    path changes): the previous file handler is replaced.
+    fallback_dir: a folder on the computer's own disk used when log_dir
+    cannot be written (see ResilientFileHandler); also used for the FFmpeg
+    logs then. Returns the log file path. Safe to call repeatedly (e.g. when
+    the save path changes): the previous file handler is replaced.
     """
+    global FALLBACK_LOG_DIR
+    if fallback_dir:
+        FALLBACK_LOG_DIR = fallback_dir
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, "studio.log")
     log.setLevel(logging.INFO)
     for h in list(log.handlers):
-        if isinstance(h, logging.FileHandler):
+        if isinstance(h, (logging.FileHandler, ResilientFileHandler)):
             if os.path.abspath(h.baseFilename) == os.path.abspath(path):
                 return path
             log.removeHandler(h)
             h.close()
-    handler = logging.handlers.TimedRotatingFileHandler(
-        path, when="midnight", backupCount=120, encoding="utf-8")
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S%z"))
+    handler = ResilientFileHandler(path, FALLBACK_LOG_DIR)
     log.addHandler(handler)
     log.propagate = False
     return path
+
+
+def _open_append(log_dir: Optional[str], name: str):
+    """Open <log_dir>/<name> for appending, or the same name in the fallback
+    log folder when log_dir cannot be written. Returns (file, path) or (None, None)."""
+    for d in (log_dir, FALLBACK_LOG_DIR):
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, name)
+            return open(path, "ab"), path
+        except OSError:
+            continue
+    return None, None
 
 
 def ffmpeg_log_file(log_dir: Optional[str], name: str):
     """Append-mode file for an FFmpeg process's stderr (or DEVNULL)."""
     if not log_dir:
         return subprocess.DEVNULL
+    f, _ = _open_append(log_dir, name)
+    if f is None:
+        return subprocess.DEVNULL
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        f = open(os.path.join(log_dir, name), "ab")
         f.write(f"\n===== {datetime.now().astimezone().isoformat(timespec='seconds')} =====\n".encode())
         f.flush()
-        return f
     except OSError:
-        return subprocess.DEVNULL
+        pass
+    return f
+
+
+def dir_writable(path: str) -> tuple[bool, str]:
+    """Can files be created in `path` right now? (ok, reason when not).
+
+    A real write test: a USB drive that the kernel switched to read-only
+    after an error still looks like a normal folder to os.access().
+    """
+    if not path:
+        return False, "no folder chosen"
+    if not os.path.isdir(path):
+        return False, f"{path} does not exist (drive disconnected or unmounted?)"
+    probe = os.path.join(path, f".amin_write_test_{os.getpid()}")
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"x")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        return False, f"{exc.strerror or exc} ({path})"
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True, ""
+
+
+def describe_exit_code(code: Optional[int]) -> str:
+    """'exit code 226 (Read-only file system)'. FFmpeg exits with -errno, which
+    the OS reports as 256 - errno on Linux / macOS."""
+    if code is None:
+        return "no exit code"
+    text = f"exit code {code}"
+    if code < 0:
+        return text + f" (killed by signal {-code})"
+    if 128 < code < 255 and not sys.platform.startswith("win"):
+        try:
+            text += f" ({os.strerror(256 - code)})"
+        except (ValueError, OverflowError):
+            pass
+    return text
+
+
+# --- stable device names (Linux) -----------------------------------------------
+# A USB reset (an electric arc, a loose cable) makes Linux re-create the camera
+# as a new /dev/videoN -- possibly swapping numbers with the other camera. The
+# links in /dev/v4l/by-id (by name + serial) and /dev/v4l/by-path (by USB port)
+# follow the physical device instead.
+V4L_LINK_DIRS = ("/dev/v4l/by-id", "/dev/v4l/by-path")
+
+
+def stable_device_path(path: Optional[str]) -> Optional[str]:
+    """A /dev/v4l/by-id (or by-path) link pointing at /dev/videoN `path`, or None."""
+    if not path or not sys.platform.startswith("linux") or not path.startswith("/dev/video"):
+        return None
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    for d in V4L_LINK_DIRS:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            link = os.path.join(d, name)
+            try:
+                if os.path.realpath(link) == real:
+                    return link
+            except OSError:
+                continue
+    return None
+
+
+def resolve_device_path(stable: Optional[str], fallback: Optional[str]) -> tuple[Optional[str], bool]:
+    """(current /dev/videoN, present). With a stable link: where it points now
+    (present=False when the device is unplugged). Without one: `fallback`."""
+    if stable:
+        if os.path.exists(stable):
+            return os.path.realpath(stable), True
+        return None, False
+    if fallback and fallback.startswith("/dev/") and sys.platform.startswith("linux"):
+        return fallback, os.path.exists(fallback)
+    return fallback, True
 
 
 def next_clock_boundary(now: datetime, period_s: int) -> datetime:
@@ -376,6 +580,9 @@ class ThermalService:
         #: (index, backend, strategy) that worked, per requested device -> fast re-open
         self._known: dict = {}
         self._known_swap: dict = {}
+        #: Linux: /dev/v4l/by-id link of the camera that opened, per requested
+        #: device -> found again after a USB reset, even under a new /dev/videoN
+        self._stable: dict = {}
 
     # --- lifecycle --------------------------------------------------------------
     @property
@@ -484,14 +691,36 @@ class ThermalService:
         while not stop.is_set():
             if cam is None:
                 key = self.device or "auto"
+                idx = device_index(self.device) if self.device else None
+                preferred = self._known.get(key)
+                stable = self._stable.get(key)
+                if stable:
+                    current, present = resolve_device_path(stable, None)
+                    if not present:
+                        # unplugged (USB reset): wait for it, do not probe other cameras
+                        self._publish(stop, error=f"thermal camera unplugged ({stable} is gone)"
+                                      "; waiting for it to come back",
+                                      found_index=None, status="RECONNECTING")
+                        stop.wait(2.0)
+                        continue
+                    new_idx = device_index(current)
+                    if new_idx is not None:
+                        if preferred and preferred[0] != new_idx:
+                            log.warning("thermal camera moved to %s after a reconnect; following it",
+                                        current)
+                            preferred = (new_idx, *preferred[1:])
+                        idx = new_idx
                 try:
-                    idx = device_index(self.device) if self.device else None
                     cam = ThermalCamera(index=idx, exclude=self.avoid,
-                                        preferred=self._known.get(key),
+                                        preferred=preferred,
                                         swap_bytes=self._known_swap.get(key),
                                         should_stop=stop.is_set).open()
                     self._known[key] = cam.resolved
                     self._known_swap[key] = cam.swap_bytes
+                    if cam.resolved and cam.resolved[0] is not None:
+                        link = stable_device_path(f"/dev/video{cam.resolved[0]}")
+                        if link:
+                            self._stable[key] = link
                     if not self._publish(stop, info=cam.info(), error="",
                                          found_index=cam.resolved[0], status="ONLINE"):
                         break
@@ -991,16 +1220,31 @@ class CameraRecorder:
       DirectShow for 3840x2160 MJPEG on a 1080p webcam makes FFmpeg exit at
       once, which used to look like a crash;
     * tests a GPU encoder before relying on it and falls back to libx264;
-    * when FFmpeg exits, reads *why* from its log and reacts: device busy ->
-      wait and retry; mode refused -> the camera's default mode; encoder
-      failure -> libx264; anything else -> restart with a growing delay
-      (2 s ... 60 s) instead of a tight restart loop.
+    * watches the frame counter FFmpeg reports (``-progress``): a camera that
+      stops delivering pictures (a USB stall from an electric arc) leaves
+      FFmpeg waiting forever without an error -- after FREEZE_TIMEOUT_S
+      without a new frame it is treated as failed, so the file is closed and
+      a new one can be started;
+    * on Linux follows the camera through /dev/v4l/by-id when a USB reset
+      gives it a new /dev/videoN, and knows when it is unplugged;
+    * when FFmpeg exits, reads *why* from its log and adapts: mode refused ->
+      the camera's default mode; encoder failure -> libx264.
 
-    The GUI calls :meth:`poll` once a second; it never blocks.
+    Two ways to drive it:
+
+    * :class:`RecordingSupervisor` (the app): start() / health() / halt(),
+      keeping it in step with the thermal recorder;
+    * stand-alone: call :meth:`poll` once a second; it restarts FFmpeg by
+      itself after RETRY_DELAYS_S (0.5 s, 2 s, 5 s, then every 10 s).
     """
 
-    MAX_BACKOFF_S = 60.0
+    RETRY_DELAYS_S = (0.5, 2.0, 5.0, 10.0)        # last one repeats forever
+    MAX_BACKOFF_S = RETRY_DELAYS_S[-1]
     HEALTHY_AFTER_S = 60.0
+    #: no new frame for this long while recording = frozen camera
+    FREEZE_TIMEOUT_S = 10.0
+    #: no first frame this long after FFmpeg started = the camera did not open
+    FIRST_FRAME_TIMEOUT_S = 20.0
 
     def __init__(self, req: RecordingRequest, *, input_override: Optional[list[str]] = None) -> None:
         self.req = req
@@ -1013,13 +1257,22 @@ class CameraRecorder:
         self.failures_in_row = 0
         self.started_at = 0.0
         self.last_error = ""
+        self.last_kind = ""
         self.notice = ""                       # one-off message for the GUI
         self.next_retry_at: Optional[float] = None
         self._log_path: Optional[str] = None
         self._log_offset = 0
         self._log_file = None
         self.stopped = False
-        #: called (GUI thread) right before a restart, e.g. to re-apply exposure
+        # frame progress, from FFmpeg's -progress output (reader thread)
+        self.frames = 0
+        self.first_frame_at: Optional[float] = None
+        self.last_frame_at = 0.0
+        self._progress_thread: Optional[threading.Thread] = None
+        # Linux: the camera's /dev/v4l/by-id link, to find it after a USB reset
+        self.stable_path = None if input_override is not None else stable_device_path(req.device.path)
+        #: called right before a restart, e.g. to re-apply exposure. When the
+        #: RecordingSupervisor drives the recorder it runs on its thread.
         self.before_start: Optional[Callable[[], None]] = None
 
     # --- planning ---------------------------------------------------------------
@@ -1044,6 +1297,8 @@ class CameraRecorder:
             if self.mode is not None:
                 log.info("camera mode for recording: %s (asked %dx%d @ %g fps)", self.mode,
                          r.width, r.height, r.fps)
+        if self.stable_path:
+            log.info("camera %s is %s (followed if its number changes)", r.device.path, self.stable_path)
 
     def describe(self) -> str:
         if self.use_default_mode or (self.mode is None and self.input_override is None):
@@ -1055,11 +1310,39 @@ class CameraRecorder:
             where = "test input"
         return f"{where}, {self.codec}"
 
+    @property
+    def device_path(self) -> str:
+        """The camera's current /dev/videoN (Linux) or the path given."""
+        return self.req.device.path
+
+    def device_problem(self) -> Optional[str]:
+        """Why the camera cannot be opened right now (None = try it).
+
+        Linux only knows this for sure; elsewhere the start itself is the test.
+        Also re-points the request at the camera's new /dev/videoN after a USB
+        reset gave it another number.
+        """
+        if self.input_override is not None:
+            return None
+        dev = self.req.device
+        current, present = resolve_device_path(self.stable_path, dev.path or None)
+        if not present:
+            return f"camera unplugged ({self.stable_path or dev.path} is gone)"
+        if current and dev.path and current != dev.path:
+            log.warning("camera moved from %s to %s after a reconnect; following it",
+                        dev.path, current)
+            self.req.device = DeviceRef(index=device_index(current), name=dev.name,
+                                        number=dev.number, path=current)
+        return None
+
     def _fps(self) -> float:
         fps = float(self.req.fps)
         if self.mode is not None and self.mode.fps and not self.use_default_mode:
             fps = min(fps, self.mode.fps)
         return fps
+
+    def output_template(self) -> str:
+        return os.path.join(self.req.out_dir, self.req.prefix + "_%Y-%m-%d_%H-%M-%S_camera.mkv")
 
     def command(self) -> list[str]:
         r = self.req
@@ -1076,13 +1359,21 @@ class CameraRecorder:
             # Mode list unavailable: ask for the size in MJPEG, as before.
             video_input = r.device.ffmpeg_input(size=f"{r.width}x{r.height}", fmt="mjpeg",
                                                 compressed=True, fps=fps, rtbufsize="512M")
-        out_template = os.path.join(r.out_dir, r.prefix + "_%Y-%m-%d_%H-%M-%S_camera.mkv")
+        # cluster_time_limit + flush_packets: the file on disk is at most ~1 s
+        # behind. A camera that freezes can leave FFmpeg stuck in a read where
+        # it cannot be stopped cleanly, only killed; without these a kill lost
+        # the last ~5 s (an open Matroska cluster in memory) -- or a whole
+        # short file.
         segment = ["-f", "segment", "-segment_time", str(r.chunk_sec),
                    "-segment_atclocktime", "1", "-reset_timestamps", "1", "-strftime", "1",
-                   "-segment_format", "matroska", out_template]
+                   "-segment_format", "matroska",
+                   "-segment_format_options", "cluster_time_limit=1000:flush_packets=1",
+                   self.output_template()]
         gop = str(max(1, int(round(fps * 2))))
         prev_rate = f"1/{max(1.0, r.preview_every_s):g}"
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "warning"]
+        # -progress: "frame=N" lines on stdout, read by _read_progress (freeze watch)
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-loglevel", "warning",
+               "-progress", "pipe:1"]
         codec = self.codec
         if codec == "h264_vaapi":
             cmd += ["-vaapi_device", "/dev/dri/renderD128"]
@@ -1120,12 +1411,20 @@ class CameraRecorder:
     # --- process ------------------------------------------------------------------
     def start(self) -> bool:
         """Start FFmpeg. False (with last_error set) if it could not be spawned."""
-        os.makedirs(self.req.out_dir, exist_ok=True)
+        try:
+            os.makedirs(self.req.out_dir, exist_ok=True)
+        except OSError as exc:
+            self.last_error = f"cannot create {self.req.out_dir}: {exc}"
+            log.error("camera recorder: %s", self.last_error)
+            return False
         cmd = self.command()
         cmd[0] = shutil.which("ffmpeg") or "ffmpeg"
         self._open_log()
+        self.frames = 0
+        self.first_frame_at = None
+        self.last_frame_at = 0.0
         try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=self._log_file or subprocess.DEVNULL,
                                          **no_window_kwargs())
         except OSError as exc:
@@ -1135,23 +1434,53 @@ class CameraRecorder:
             return False
         self.started_at = time.time()
         self.next_retry_at = None
+        self._progress_thread = threading.Thread(target=self._read_progress, args=(self.proc,),
+                                                 name="camera-ffmpeg-progress", daemon=True)
+        self._progress_thread.start()
         log.info("camera ffmpeg started (%s): %s", self.describe(), " ".join(cmd))
         return True
+
+    def _read_progress(self, proc: subprocess.Popen) -> None:
+        """Count frames from FFmpeg's -progress lines ('frame=123')."""
+        # Reads until FFmpeg exits (so its stdout never fills up), but only the
+        # current run updates the counters.
+        try:
+            for line in iter(proc.stdout.readline, b""):
+                if not line.startswith(b"frame=") or proc is not self.proc:
+                    continue
+                try:
+                    n = int(line[6:].strip() or 0)
+                except ValueError:
+                    continue
+                if n > self.frames:
+                    now = time.time()
+                    self.frames = n
+                    self.last_frame_at = now
+                    if self.first_frame_at is None:
+                        self.first_frame_at = now
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
     def _open_log(self) -> None:
         self._close_log()
         if not self.req.log_dir:
             return
+        f, path = _open_append(self.req.log_dir, "ffmpeg_camera.log")
+        self._log_file, self._log_path = f, path
+        if f is None:
+            return
         try:
-            os.makedirs(self.req.log_dir, exist_ok=True)
-            self._log_path = os.path.join(self.req.log_dir, "ffmpeg_camera.log")
-            self._log_file = open(self._log_path, "ab")
-            self._log_file.write(f"\n===== {datetime.now().astimezone().isoformat(timespec='seconds')}"
-                                 f"  {self.describe()} =====\n".encode())
-            self._log_file.flush()
-            self._log_offset = self._log_file.tell()
+            f.write(f"\n===== {datetime.now().astimezone().isoformat(timespec='seconds')}"
+                    f"  {self.describe()} =====\n".encode())
+            f.flush()
+            self._log_offset = f.tell()
         except OSError:
-            self._log_file, self._log_path = None, None
+            self._log_offset = 0
 
     def _close_log(self) -> None:
         if self._log_file is not None:
@@ -1165,18 +1494,114 @@ class CameraRecorder:
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def health(self) -> Optional[str]:
+        """None while FFmpeg runs and pictures arrive, else what is wrong."""
+        proc = self.proc
+        if proc is None:
+            return "not running"
+        code = proc.poll()
+        if code is not None:
+            return f"ffmpeg exited ({describe_exit_code(code)})"
+        now = time.time()
+        if self.first_frame_at is None:
+            if now - self.started_at > self.FIRST_FRAME_TIMEOUT_S:
+                return f"no picture from the camera {self.FIRST_FRAME_TIMEOUT_S:.0f} s after starting"
+            return None
+        if now - self.last_frame_at > self.FREEZE_TIMEOUT_S:
+            return f"camera picture frozen for {now - self.last_frame_at:.0f} s"
+        return None
+
+    def halt(self, problem: str = "", camera_fault: bool = True) -> str:
+        """Stop FFmpeg (finalising the file where possible) and work out why it
+        failed; adapt the encoder / mode for the next start. Returns the
+        reason. Blocks for up to ~10 s (a frozen FFmpeg may need killing).
+
+        camera_fault=False: stopped because of the OTHER camera -- a clean
+        stop, not counted as a camera failure."""
+        proc, self.proc = self.proc, None
+        ran = time.time() - self.started_at
+        code = None
+        if proc is not None:
+            # frozen in a camera read: 'q' may never be seen -> shorter wait
+            stop_ffmpeg(proc, timeout=4.0 if "frozen" in problem or "no picture" in problem
+                        else 10.0)
+            code = proc.poll()
+        if self._log_file is not None:
+            try:
+                self._log_file.flush()
+            except Exception:
+                pass
+        if not camera_fault:
+            self._close_log()
+            log.info("camera recording stopped after %.0f s: %s", ran, problem or "stopped")
+            return problem
+        lines = _last_lines(self._log_path, self._log_offset)
+        why = problem or f"ffmpeg exited ({describe_exit_code(code)})"
+        if lines:
+            why = f"{why} | {lines}"
+        kind = _classify_ffmpeg_error(lines or why)
+        self.last_error = why[-300:]
+        self.last_kind = kind
+        self.failures_in_row = self.failures_in_row + 1 if ran < self.HEALTHY_AFTER_S else 1
+        log.error("camera recording stopped after %.0f s (%s): %s", ran, kind, why)
+        if kind == "encoder" and self.codec != "libx264":
+            log.warning("camera encoder %s failed; switching to libx264", self.codec)
+            self.notice = f"{self.codec} FAILED  •  SWITCHED TO LIBX264"
+            self.codec = "libx264"
+        elif kind == "mode" and not self.use_default_mode and self.input_override is None:
+            log.warning("camera refused mode %s; using its default mode", self.mode)
+            self.notice = "CAMERA REFUSED THE MODE  •  USING ITS DEFAULT MODE"
+            self.use_default_mode = True
+        elif (kind == "device" and self.failures_in_row >= 3 and not self.use_default_mode
+              and self.input_override is None and self.first_frame_at is None):
+            self.use_default_mode = True
+        self._close_log()
+        return why
+
+    def retry_delay(self) -> float:
+        """Seconds to wait before the next start (no overflow, however many)."""
+        if self.last_kind == "encoder" and self.failures_in_row <= 1:
+            return 0.5
+        i = max(0, min(self.failures_in_row - 1, len(self.RETRY_DELAYS_S) - 1))
+        return self.RETRY_DELAYS_S[i]
+
+    def segment_stamp(self, since: Optional[float] = None) -> Optional[datetime]:
+        """Time stamp in the name of the newest file this FFmpeg run is
+        writing, once it exists (the thermal file gets the same name).
+        since: only files stamped at or after this unix time."""
+        if since is None:
+            since = self.started_at - 2
+        prefix = self.req.prefix + "_"
+        best = None
+        try:
+            names = os.listdir(self.req.out_dir)
+        except OSError:
+            return None
+        for name in names:
+            if not (name.startswith(prefix) and name.endswith("_camera.mkv")):
+                continue
+            try:
+                stamp = datetime.strptime(name[len(prefix):len(prefix) + 19], STAMP_FMT)
+            except ValueError:
+                continue
+            if stamp.timestamp() >= since and (best is None or stamp > best):
+                best = stamp
+        return best
+
+    # --- stand-alone use (self-restarting) -------------------------------------------
     def poll(self) -> Optional[str]:
         """Check FFmpeg; restart it when due. Returns a status word when
         something happened: 'exited', 'restarted', 'retry-failed', or None."""
         if self.stopped:
             return None
         if self.proc is not None:
-            code = self.proc.poll()
-            if code is None:
+            problem = self.health()
+            if problem is None:
                 if time.time() - self.started_at > self.HEALTHY_AFTER_S:
                     self.failures_in_row = 0
                 return None
-            self._on_exit(code)
+            self.halt(problem)
+            self._schedule_retry(self.retry_delay())
             return "exited"
         if self.next_retry_at is not None and time.time() >= self.next_retry_at:
             self.restarts += 1
@@ -1185,52 +1610,18 @@ class CameraRecorder:
                     self.before_start()
                 except Exception as exc:
                     log.warning("before camera restart: %s", exc)
-            if self.start():
+            problem = self.device_problem()
+            if problem is None and self.start():
                 return "restarted"
-            self._schedule_retry()
+            self.last_error = problem or self.last_error
+            self.failures_in_row += 1
+            self._schedule_retry(self.retry_delay())
             return "retry-failed"
         return None
 
-    def _on_exit(self, code: int) -> None:
-        ran = time.time() - self.started_at
-        proc, self.proc = self.proc, None
-        try:
-            if proc is not None and proc.stdin:
-                proc.stdin.close()
-        except Exception:
-            pass
-        if self._log_file is not None:
-            try:
-                self._log_file.flush()
-            except Exception:
-                pass
-        why = _last_lines(self._log_path, self._log_offset) or f"exit code {code}"
-        kind = _classify_ffmpeg_error(why)
-        self.last_error = why[-300:]
-        self.failures_in_row = self.failures_in_row + 1 if ran < self.HEALTHY_AFTER_S else 1
-        log.error("camera ffmpeg exited (code %s after %.0f s, %s): %s", code, ran, kind, why)
-        delay = None
-        if kind == "encoder" and self.codec != "libx264":
-            log.warning("camera encoder %s failed; switching to libx264", self.codec)
-            self.notice = f"{self.codec} FAILED  •  SWITCHED TO LIBX264"
-            self.codec = "libx264"
-            delay = 0.5
-        elif kind == "mode" and not self.use_default_mode and self.input_override is None:
-            log.warning("camera refused mode %s; using its default mode", self.mode)
-            self.notice = "CAMERA REFUSED THE MODE  •  USING ITS DEFAULT MODE"
-            self.use_default_mode = True
-            delay = 1.0
-        elif kind == "device" and self.failures_in_row == 1:
-            delay = 3.0            # usually: the preview had not released the camera yet
-        elif (kind == "device" and self.failures_in_row == 3 and not self.use_default_mode
-              and self.input_override is None):
-            self.use_default_mode = True
-            delay = 3.0
-        self._schedule_retry(delay)
-
     def _schedule_retry(self, delay: Optional[float] = None) -> None:
         if delay is None:
-            delay = min(self.MAX_BACKOFF_S, 2.0 * (2 ** max(0, self.failures_in_row - 1)))
+            delay = self.retry_delay()
         self.next_retry_at = time.time() + delay
         log.info("camera ffmpeg restart in %.0f s", delay)
 
@@ -1276,7 +1667,8 @@ class ThermalVideoRecorder:
     def __init__(self, service: ThermalService, pipeline: ThermalPipeline, *,
                  out_dir: str, prefix: str, fps: float, chunk_sec: int,
                  outputs: tuple[str, ...], crf: str, preset: str, overlay: bool,
-                 log_dir: Optional[str] = None) -> None:
+                 log_dir: Optional[str] = None, supervised: bool = False,
+                 cut_stamp: Optional[Callable[[datetime], Optional[datetime]]] = None) -> None:
         self.service = service
         self.pipeline = pipeline
         self.out_dir = out_dir
@@ -1288,6 +1680,17 @@ class ThermalVideoRecorder:
         self.preset = preset
         self.overlay = overlay
         self.log_dir = log_dir
+        #: True when a RecordingSupervisor runs this recorder: a dead encoder
+        #: or an unwritable file is then reported in `failure` (the supervisor
+        #: restarts camera AND thermal together) instead of retried here.
+        self.supervised = supervised
+        #: at a clock boundary: returns the stamp of the camera's new file once
+        #: it exists, so the thermal file is cut at the same moment and gets
+        #: the same name (the camera can only cut on a key frame, ~0-2 s late)
+        self.cut_stamp = cut_stamp
+        self.CUT_WAIT_S = 5.0
+        self.failure = ""
+        self.first_stamp: Optional[datetime] = None
         self.procs: dict[str, subprocess.Popen] = {}
         self._closing: list[threading.Thread] = []
         self.thread: Optional[threading.Thread] = None
@@ -1379,9 +1782,12 @@ class ThermalVideoRecorder:
             t.start()
             self._closing.append(t)
 
-    def start(self) -> None:
+    def start(self, stamp: Optional[datetime] = None) -> None:
+        """Start recording. `stamp`: time for the first file names (the
+        supervisor passes the camera file's, so both carry the same name)."""
         os.makedirs(self.out_dir, exist_ok=True)
-        start = datetime.now().replace(microsecond=0)
+        start = (stamp or datetime.now()).replace(microsecond=0)
+        self.first_stamp = start
         rec_base = os.path.join(self.out_dir, f"{self.prefix}_{start.strftime(STAMP_FMT)}")
         self._write_info(rec_base, start)
         self._settings_file = open(rec_base + "_thermal_settings.csv", "w", newline="")
@@ -1391,6 +1797,10 @@ class ThermalVideoRecorder:
         self._stop.clear()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+
+    def request_stop(self) -> None:
+        """Stop writing frames now (stop() then waits for the files to close)."""
+        self._stop.set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -1402,9 +1812,19 @@ class ThermalVideoRecorder:
             t.join(timeout=35)
         self._closing.clear()
         if self._settings_file is not None:
-            self._settings_file.close()
+            try:
+                self._settings_file.close()
+            except OSError:
+                pass
             self._settings_file = None
         log.info("thermal recorder stopped: %d frames written", self.frames_written)
+
+    def _fail(self, why: str) -> None:
+        """Supervised: report a failure and stop writing (no own retries)."""
+        self.failure = why
+        self.last_error = why
+        log.error("thermal recorder: %s", why)
+        self._close_chunk()
 
     def _write_info(self, rec_base: str, start: datetime) -> None:
         info = {
@@ -1440,7 +1860,10 @@ class ThermalVideoRecorder:
             datetime.now().astimezone().isoformat(timespec="milliseconds"), event,
             snap["correction"], " ".join(f"{c:.8g}" for c in snap["coeffs"]),
             snap["span"], snap["colormap"], json.dumps(snap["ref_points"])])
-        self._settings_file.flush()
+        try:
+            self._settings_file.flush()
+        except OSError as exc:
+            self.last_error = f"settings file: {exc}"
         if event == "changed":
             log.info("thermal settings changed during recording: %s, coeffs %s, span %s",
                      snap["correction"], snap["coeffs"], snap["span"])
@@ -1482,10 +1905,13 @@ class ThermalVideoRecorder:
         if self._stop.is_set():
             return
 
-        now_dt = datetime.now().replace(microsecond=0)
+        now_dt = self.first_stamp or datetime.now().replace(microsecond=0)
         try:
             self._open_chunk(now_dt)
         except Exception as exc:
+            if self.supervised:
+                self._fail(f"cannot start the thermal files: {exc}")
+                return
             self.last_error = f"cannot start encoder: {exc}"
             log.error("thermal recorder: %s", self.last_error)
             return
@@ -1493,6 +1919,7 @@ class ThermalVideoRecorder:
         boundary = next_clock_boundary(datetime.now(), self.chunk_sec)
         next_t = time.time()
         last_settings_check = 0.0
+        last_cut_check = 0.0
         last_flush = time.time()
         retry_at: Optional[float] = None
         failures = 0
@@ -1507,9 +1934,29 @@ class ThermalVideoRecorder:
                 next_t = now + period
 
             if datetime.now() >= boundary and retry_at is None:
+                cut_at = boundary
+                if self.cut_stamp is not None:
+                    found = None
+                    if now - last_cut_check >= 0.2:
+                        last_cut_check = now
+                        try:
+                            found = self.cut_stamp(boundary)
+                        except Exception:
+                            found = None
+                    late = (datetime.now() - boundary).total_seconds()
+                    if found is None and late < self.CUT_WAIT_S:
+                        cut_at = None          # camera has not cut yet: keep this file a moment
+                    else:
+                        cut_at = found or boundary
+            else:
+                cut_at = None
+            if cut_at is not None:
                 try:
-                    self._open_chunk(boundary)
+                    self._open_chunk(cut_at)
                 except Exception as exc:
+                    if self.supervised:
+                        self._fail(f"cannot open the next thermal file: {exc}")
+                        return
                     self.last_error = f"chunk open failed: {exc}"
                     log.error("thermal recorder: %s", self.last_error)
                 boundary = next_clock_boundary(datetime.now(), self.chunk_sec)
@@ -1538,6 +1985,11 @@ class ThermalVideoRecorder:
                     continue
 
             died = next((k for k, p in self.procs.items() if p.poll() is not None), None)
+            if died is not None and self.supervised:
+                self._fail(f"thermal {died} encoder exited "
+                           f"({describe_exit_code(self.procs[died].returncode)})"
+                           f" -- see logs/ffmpeg_thermal_{died}.log")
+                return
             if died is not None:
                 code = self.procs[died].returncode
                 failures = failures + 1 if now - self._chunk_opened_at < 30 else 1
@@ -1559,18 +2011,326 @@ class ThermalVideoRecorder:
             if not self.procs:
                 continue
             if self._frames_writer is not None:
-                self._frames_writer.writerow([
-                    self.chunk_frames,
-                    datetime.fromtimestamp(now).astimezone().isoformat(timespec="milliseconds"),
-                    f"{now:.3f}", f"{now - ts:.3f}" if raw_c is not None else "", 1 if fresh else 0])
-                if now - last_flush > 2.0:
-                    self._frames_csv.flush()
-                    last_flush = now
+                try:
+                    self._frames_writer.writerow([
+                        self.chunk_frames,
+                        datetime.fromtimestamp(now).astimezone().isoformat(timespec="milliseconds"),
+                        f"{now:.3f}", f"{now - ts:.3f}" if raw_c is not None else "", 1 if fresh else 0])
+                    if now - last_flush > 2.0:
+                        self._frames_csv.flush()
+                        last_flush = now
+                except OSError as exc:
+                    if self.supervised:
+                        self._fail(f"cannot write the thermal frame list: {exc}")
+                        return
+                    self.last_error = f"frames csv: {exc}"
             self.chunk_frames += 1
             self.frames_written += 1
 
     def estimate_mbps(self) -> float:
         return estimate_thermal_mbps(self.outputs, self.fps)
+
+
+# =============================================================================
+# Recording supervisor: camera + thermal, started, stopped and restarted together
+# =============================================================================
+class RecordingSupervisor:
+    """Runs the camera and the thermal recording together and keeps them in step.
+
+    Strict sync: both cameras record, or neither does.
+
+    * A pair of files starts together: the camera FFmpeg starts first and, as
+      soon as its first picture is written, the thermal recorder starts with
+      the camera file's time stamp, so both files carry the same name.
+    * When EITHER side has a problem -- the camera FFmpeg exited, the camera
+      picture froze, the thermal picture was lost, a thermal encoder died, a
+      file could not be written -- BOTH are stopped at once and their files
+      closed. Then it retries until both work again: at once, then after
+      2 s, 5 s, and every 10 s from then on, for as long as it takes.
+    * Before each retry it checks what it can without touching the cameras:
+      the recording folder can be written, the thermal camera delivers
+      pictures, the camera is plugged in (Linux). The GUI shows why it waits.
+    * The clock-aligned chunks (every :00 / :30 ...) carry on as before; at a
+      boundary the thermal file is cut when the camera's is, with its name.
+
+    It runs on its own thread, so neither a frozen camera nor a busy (or
+    broken) GUI timer can stop the recovery. The GUI reads `state`, `reason`,
+    `pair_started` and the `events` queue of (kind, message, camera_device),
+    kind in "started", "resumed", "interrupted", "waiting", "notice".
+    """
+
+    TICK_S = 0.5
+    #: no fresh thermal frame for this long while recording = thermal lost
+    THERMAL_LOST_S = 4.0
+    #: a thermal frame at most this old = thermal ready to (re)start
+    THERMAL_FRESH_S = 1.5
+    #: wait before retry n after an interruption (the last value repeats)
+    RETRY_DELAYS_S = (0.0, 2.0, 5.0, 10.0)
+    #: while waiting for a device / the drive: check this often
+    RECHECK_S = 1.0
+    #: a pair that ran this long counts as healthy (retries start over at 0 s)
+    HEALTHY_AFTER_S = 60.0
+
+    RECORDING, STARTING, WAITING, STOPPED = "RECORDING", "STARTING", "WAITING", "STOPPED"
+
+    def __init__(self, out_dir: str, *, camera: Optional[CameraRecorder] = None,
+                 thermal_service: Optional[ThermalService] = None,
+                 make_thermal: Optional[Callable[[], ThermalVideoRecorder]] = None) -> None:
+        if camera is None and make_thermal is None:
+            raise ValueError("nothing to record")
+        if make_thermal is not None and thermal_service is None:
+            raise ValueError("thermal recording needs the thermal service")
+        self.out_dir = out_dir
+        self.camera = camera
+        self.thermal_service = thermal_service
+        self.make_thermal = make_thermal
+        self.thermal_rec: Optional[ThermalVideoRecorder] = None
+        self.state = self.WAITING
+        self.reason = "starting"
+        self.events: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
+        self.interruptions = 0
+        self.failures_in_row = 0
+        self.pairs_started = 0
+        self.pair_started: Optional[float] = None
+        self.retry_at = 0.0
+        self.thermal_frames_done = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # --- public -----------------------------------------------------------------
+    @property
+    def what(self) -> str:
+        return " + ".join(x for x, on in (("CAMERA", self.camera is not None),
+                                          ("THERMAL", self.make_thermal is not None)) if on)
+
+    @property
+    def thermal_frames(self) -> int:
+        rec = self.thermal_rec
+        return self.thermal_frames_done + (rec.frames_written if rec is not None else 0)
+
+    def camera_running(self) -> bool:
+        return self.camera is not None and self.camera.proc is not None
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="recording-supervisor", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 15.0) -> None:
+        """Stop for good (the user pressed STOP): both files are finalised."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=60)
+        self._thread = None
+        rec, self.thermal_rec = self.thermal_rec, None
+        if rec is not None:
+            rec.request_stop()
+        if self.camera is not None:
+            self.camera.stop(timeout=timeout)
+        if rec is not None:
+            try:
+                rec.stop()
+            except Exception as exc:
+                log.warning("thermal recorder stop: %s", exc)
+            self.thermal_frames_done += rec.frames_written
+        self.state = self.STOPPED
+        self.pair_started = None
+
+    # --- thread -------------------------------------------------------------------
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception:
+                # never let a bug end the supervision of a long recording
+                log.exception("recording supervisor")
+                self._stop.wait(2.0)
+            self._stop.wait(self.TICK_S)
+
+    def _tick(self) -> None:
+        if self.state == self.RECORDING:
+            problem = self._problem()
+            if problem is not None:
+                self._interrupt(*problem)
+            elif (self.pair_started and self.failures_in_row
+                  and time.time() - self.pair_started > self.HEALTHY_AFTER_S):
+                self.failures_in_row = 0
+            return
+        if time.time() < self.retry_at:
+            return
+        blocker = self._blocker()
+        if blocker:
+            self._set_reason(blocker)
+            self.retry_at = time.time() + self.RECHECK_S
+            return
+        self._try_start()
+
+    # --- checks -------------------------------------------------------------------
+    def _thermal_age(self) -> float:
+        raw, ts, _ = self.thermal_service.latest()
+        return float("inf") if raw is None or not ts else time.time() - ts
+
+    def _thermal_state(self) -> str:
+        svc = self.thermal_service
+        return f"{svc.status}: {svc.error}" if svc.error else svc.status
+
+    def _blocker(self) -> Optional[str]:
+        """Why a start would fail now (None = try it)."""
+        ok, why = dir_writable(self.out_dir)
+        if not ok:
+            return f"RECORDING FOLDER CANNOT BE WRITTEN: {why}"
+        if self.make_thermal is not None:
+            if self.thermal_service.status != "ONLINE" or self._thermal_age() > self.THERMAL_FRESH_S:
+                return f"WAITING FOR THE THERMAL CAMERA ({self._thermal_state()})"
+        if self.camera is not None:
+            problem = self.camera.device_problem()
+            if problem:
+                return f"WAITING FOR THE CAMERA: {problem}"
+        return None
+
+    def _thermal_problem(self) -> Optional[str]:
+        age = self._thermal_age()
+        if age > self.THERMAL_LOST_S:
+            lost = "no picture" if age == float("inf") else f"no picture for {age:.0f} s"
+            return f"THERMAL CAMERA: {lost} ({self._thermal_state()})"
+        return None
+
+    def _problem(self) -> Optional[tuple[str, str]]:
+        """(source, description) of what broke while recording, or None."""
+        if self.camera is not None:
+            p = self.camera.health()
+            if p is not None:
+                return "camera", p
+        rec = self.thermal_rec
+        if rec is not None:
+            if rec.failure:
+                return "thermal", f"THERMAL: {rec.failure}"
+            p = self._thermal_problem()
+            if p is not None:
+                return "thermal", p
+        return None
+
+    # --- transitions --------------------------------------------------------------
+    def _set_reason(self, reason: str) -> None:
+        if reason != self.reason:
+            self.reason = reason
+            log.warning("recording paused (%s): %s", self.what, reason)
+            self.events.put(("waiting", reason, ""))
+
+    def _try_start(self) -> None:
+        self.state = self.STARTING
+        cam = self.camera
+        stamp: Optional[datetime] = None
+        if cam is not None:
+            if cam.before_start is not None:
+                try:
+                    cam.before_start()
+                except Exception as exc:
+                    log.warning("before camera start: %s", exc)
+            if not cam.start():
+                self._start_failed(f"CAMERA: {cam.last_error}")
+                return
+            # wait for the camera's first picture before starting the thermal file
+            while not self._stop.is_set():
+                p = cam.health()
+                if p is not None:
+                    self._start_failed("CAMERA: " + cam.halt(p))
+                    return
+                if cam.first_frame_at is not None:
+                    break
+                if self.make_thermal is not None:
+                    tp = self._thermal_problem()
+                    if tp is not None:
+                        cam.halt(tp, camera_fault=False)
+                        self._start_failed(tp)
+                        return
+                self._stop.wait(0.2)
+            if self._stop.is_set():
+                return                     # stop() finishes the camera
+            deadline = time.time() + 3.0
+            while stamp is None and time.time() < deadline and not self._stop.is_set():
+                stamp = cam.segment_stamp()
+                if stamp is None:
+                    self._stop.wait(0.2)
+            if stamp is None:
+                stamp = datetime.fromtimestamp(cam.first_frame_at)
+            notice = cam.take_notice()
+            if notice:
+                self.events.put(("notice", notice, ""))
+        else:
+            stamp = datetime.now()
+        if self.make_thermal is not None:
+            rec = self.make_thermal()
+            rec.supervised = True
+            if cam is not None:
+                rec.cut_stamp = lambda b, cam=cam: cam.segment_stamp(since=b.timestamp())
+            try:
+                rec.start(stamp=stamp)
+            except Exception as exc:
+                try:
+                    rec.stop()
+                except Exception:
+                    pass
+                why = f"THERMAL: cannot start the thermal files: {exc}"
+                if cam is not None:
+                    cam.halt(why, camera_fault=False)
+                self._start_failed(why)
+                return
+            self.thermal_rec = rec
+        self.state = self.RECORDING
+        self.pair_started = time.time()
+        self.pairs_started += 1
+        first = self.pairs_started == 1
+        name = stamp.strftime(STAMP_FMT)
+        detail = self.camera.describe() if self.camera is not None else ""
+        log.info("RECORDING %s: %s, file names *_%s_*%s", "STARTED" if first else "RESUMED",
+                 self.what, name, f"  ({detail})" if detail else "")
+        self.reason = ""
+        self.events.put(("started" if first else "resumed",
+                         f"{self.what}  •  FILES {name}" + (f"  •  {detail.upper()}" if detail else ""),
+                         cam.device_path if cam is not None else ""))
+
+    def _start_failed(self, why: str) -> None:
+        self.failures_in_row += 1
+        delay = self.RETRY_DELAYS_S[min(self.failures_in_row, len(self.RETRY_DELAYS_S) - 1)]
+        self.state = self.WAITING
+        self.retry_at = time.time() + delay
+        self.reason = ""                    # always report a failed start
+        self._set_reason(why)
+
+    def _interrupt(self, source: str, problem: str) -> None:
+        now = time.time()
+        ran = now - (self.pair_started or now)
+        self.interruptions += 1
+        log.error("RECORDING INTERRUPTED after %.0f s: %s -- stopping %s together",
+                  ran, problem, self.what)
+        rec, self.thermal_rec = self.thermal_rec, None
+        if rec is not None:
+            rec.request_stop()                     # thermal stops writing right now
+        cam = self.camera
+        if cam is not None and cam.proc is not None:
+            why = cam.halt(problem, camera_fault=(source == "camera"))
+            if source == "camera":
+                problem = "CAMERA: " + why
+        if rec is not None:
+            try:
+                rec.stop()
+            except Exception as exc:
+                log.warning("thermal recorder stop: %s", exc)
+            self.thermal_frames_done += rec.frames_written
+        self.pair_started = None
+        ok, why = dir_writable(self.out_dir)
+        if not ok:
+            # the drive itself failed: that is the cause to show, not FFmpeg's exit code
+            problem = f"RECORDING FOLDER CANNOT BE WRITTEN: {why}  (then: {problem})"
+        self.failures_in_row = self.failures_in_row + 1 if ran < self.HEALTHY_AFTER_S else 1
+        delay = self.RETRY_DELAYS_S[min(self.failures_in_row - 1, len(self.RETRY_DELAYS_S) - 1)]
+        self.state = self.WAITING
+        self.retry_at = now + delay
+        self.reason = problem
+        self.events.put(("interrupted", problem, ""))
+
 
 
 def estimate_thermal_mbps(outputs, fps: float) -> float:

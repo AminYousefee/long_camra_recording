@@ -197,39 +197,58 @@ def main():
         t0 = time.time()
         cam_rec.plan()
         say(f"  plan ({time.time() - t0:.1f} s): {cam_rec.describe()}  {cam_rec.take_notice()}")
-        check("camera ffmpeg starts", cam_rec.start(), cam_rec.last_error)
-    th_rec = None
-    if opened:
-        th_rec = S.ThermalVideoRecorder(thermal, pipeline, out_dir=rec_dir, prefix="selftest",
-                                        fps=25, chunk_sec=60, outputs=("color", "raw"), crf="23",
-                                        preset="veryfast", overlay=True, log_dir=os.path.join(OUT, "logs"))
-        th_rec.start()
+    th_rec = None              # (set only for the file checks below)
+
+    def make_thermal():
+        return S.ThermalVideoRecorder(thermal, pipeline, out_dir=rec_dir, prefix="selftest",
+                                      fps=25, chunk_sec=60, outputs=("color", "raw"), crf="23",
+                                      preset="veryfast", overlay=True, log_dir=os.path.join(OUT, "logs"))
+    # The same supervisor the app uses: both start together, and when one
+    # fails both stop and restart together (strict sync).
+    sup = None
+    if cam_rec is not None or opened:
+        sup = S.RecordingSupervisor(rec_dir, camera=cam_rec,
+                                    thermal_service=thermal if opened else None,
+                                    make_thermal=make_thermal if opened else None)
+        sup.start()
     events = []
     t0 = time.time()
-    killed = False
-    while time.time() - t0 < seconds:
-        if cam_rec is not None:
-            if not killed and time.time() - t0 > seconds * 0.45 and cam_rec.proc is not None:
-                say("  ... killing the camera FFmpeg on purpose (crash-recovery test)")
-                cam_rec.proc.kill()
-                killed = True
-            ev = cam_rec.poll()
-            if ev:
-                events.append((round(time.time() - t0, 1), ev))
-                say(f"  t={time.time() - t0:5.1f}s camera recorder: {ev}  {cam_rec.last_error[-160:] if ev == 'exited' else ''}")
+    started = killed = False
+    while sup is not None and time.time() - t0 < seconds:
+        if not started and sup.state == sup.RECORDING:
+            started = True
+            say(f"  t={time.time() - t0:5.1f}s recording: {sup.what}")
+        if (cam_rec is not None and started and not killed and time.time() - t0 > seconds * 0.45
+                and cam_rec.proc is not None):
+            say("  ... killing the camera FFmpeg on purpose (crash-recovery test: both must restart)")
+            cam_rec.proc.kill()
+            killed = True
+        while not sup.events.empty():
+            kind, msg, _ = sup.events.get_nowait()
+            events.append((round(time.time() - t0, 1), kind))
+            say(f"  t={time.time() - t0:5.1f}s {kind}: {msg[:160]}")
         time.sleep(0.5)
-    if cam_rec is not None:
-        cam_rec.stop()
-        check("camera ffmpeg restarted after the crash", ("restarted" in [e for _, e in events]) or not killed,
-              str(events))
-        unplanned = [e for e in events if e[1] == "exited"]
-        check("no unplanned camera ffmpeg exits", len(unplanned) <= 1, str(unplanned))
-    if th_rec is not None:
-        th_rec.stop()
+    if sup is not None:
+        check("recording started", started, sup.reason)
+        sup.stop()
+        kinds = [e for _, e in events]
+        if killed:
+            check("both restarted after the camera crash", "resumed" in kinds, str(events))
+        check("no unplanned interruptions", sup.interruptions <= (1 if killed else 0),
+              f"{sup.interruptions} interruptions: {events}")
+        if opened:
+            th_rec = True
     thermal.shutdown()
 
     say("\n=== 5. Files ===")
     cams_mkv = sorted(glob.glob(os.path.join(rec_dir, "selftest_*_camera.mkv")))
+    if cam_rec is not None and th_rec is not None:
+        def stamps(paths, suffix):
+            return {os.path.basename(p)[len("selftest_"):-len(suffix)] for p in paths}
+        cam_names = stamps(cams_mkv, "_camera.mkv")
+        th_names = stamps(glob.glob(os.path.join(rec_dir, "selftest_*_thermal_raw.mkv")), "_thermal_raw.mkv")
+        check("every camera file has a thermal file with the same name", cam_names == th_names,
+              f"camera {sorted(cam_names)}  thermal {sorted(th_names)}")
     if cam_rec is not None:
         total = 0
         for p in cams_mkv:

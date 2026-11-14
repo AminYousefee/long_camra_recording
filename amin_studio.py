@@ -4,6 +4,7 @@ import json
 import time
 import shutil
 import threading
+import queue
 import re
 import tempfile
 from collections import deque
@@ -47,6 +48,8 @@ from studio_services import (  # noqa: E402
     COLORBAR_WIDTH,
     CameraRecorder,
     RecordingRequest,
+    RecordingSupervisor,
+    dir_writable,
     SleepInhibitor,
     OpenCVControls,
     ServiceControls,
@@ -198,7 +201,9 @@ class AdvancedRecorderApp:
         self.cam_recorder = None          # CameraRecorder while recording
         self.start_time = None
         self.is_recording = False
-        self.thermal_recorder = None
+        self.thermal_recorder = None      # (unused; the supervisor owns it)
+        #: RecordingSupervisor while recording: runs camera + thermal in step
+        self.supervisor = None
 
         # Time-lapse state
         self.is_timelapse = False
@@ -261,7 +266,7 @@ class AdvancedRecorderApp:
         self._locked_values = None
         self._log_dir = os.path.join(CONFIG_DIR, "logs")
         try:
-            setup_logging(self._log_dir)
+            setup_logging(self._log_dir, fallback_dir=self._log_dir)
         except Exception:
             pass
         log.info("===== Amin Studio started (pid %d) =====", os.getpid())
@@ -2081,7 +2086,12 @@ class AdvancedRecorderApp:
 
         try:
             p = self._recording_params()
-            os.makedirs(p["out_dir"], exist_ok=True)
+            try:
+                os.makedirs(p["out_dir"], exist_ok=True)
+            except OSError:
+                if not resumed:
+                    raise
+                # auto-resume after a reboot: the drive may come later -> wait for it
         except ValueError:
             self.show_alert("INVALID RECORDING PARAMETER  •  CHUNK MUST BE ≥ 1 MIN", "error", 5000)
             return
@@ -2107,57 +2117,76 @@ class AdvancedRecorderApp:
             if IS_WINDOWS:
                 time.sleep(0.5)        # Windows frees a camera handle asynchronously
 
-        if use_cam and not have_v4l2_ctl():
-            self._apply_controls_before_ffmpeg(camera, fresh=True)
-        if use_cam and not self._start_camera_recorder():
+        def give_up(message):
             if use_th:
                 self.thermal.release("record")
+            self.show_alert(message, "error", 12000)
+
+        if not shutil.which("ffmpeg"):
+            give_up("FFMPEG NOT FOUND  •  RECORDING CANNOT START")
+            return
+        ok, why = dir_writable(p["out_dir"])
+        if not ok and not resumed:
+            # (an auto-resume after a reboot waits for the drive instead)
+            give_up(f"CANNOT WRITE TO THE RECORDING FOLDER  •  {why}")
             return
 
-        if use_th:
-            self._start_thermal_recorder(p)
+        if use_cam and not have_v4l2_ctl():
+            self._apply_controls_before_ffmpeg(camera, fresh=True)
+        cam_rec = None
+        if use_cam:
+            cam_rec = self._make_camera_recorder()
+            if cam_rec is None:
+                if use_th:
+                    self.thermal.release("record")
+                return
+
+        # The supervisor starts both, and stops / restarts both together when
+        # either one fails (strict sync), on its own thread.
+        self.cam_recorder = cam_rec
+        self.supervisor = RecordingSupervisor(
+            p["out_dir"], camera=cam_rec,
+            thermal_service=self.thermal if use_th else None,
+            make_thermal=(lambda: self._make_thermal_recorder(p)) if use_th else None)
+        self._last_sup_state = None
+        self.supervisor.start()
 
         self.is_recording = True
         self.start_time = time.time()
         self._begin_capture_session("video", resumed)
-        what = " + ".join(x for x, on in (("CAMERA", use_cam), ("THERMAL", use_th)) if on)
-        log.info("RECORDING STARTED%s  %s  -> %s  (%s %s fps %s crf %s, chunks %d min, prefix %s)",
+        what = self.supervisor.what
+        log.info("RECORDING REQUESTED%s  %s  -> %s  (%s %s fps %s crf %s, chunks %d min, prefix %s)",
                  " (resumed)" if resumed else "", what, p["out_dir"], p["res"], p["fps"],
                  p["codec"], p["crf"], p["chunk_sec"] // 60, p["prefix"])
-        if use_cam and have_v4l2_ctl():
-            # Once the stream runs, lock / set exposure etc. if requested.
-            self.root.after(4000, lambda: self._apply_camera_controls_async(camera, fresh=True))
 
         self.record_btn.configure(
             text="■  STOP RECORDING",
             fg_color=COLORS["red"],
             hover_color="#C93C37",
         )
-        self.status_text.configure(text="RECORDING ACTIVE", text_color=COLORS["red"])
-        self.status_dot.configure(text_color=COLORS["red"])
+        self.status_text.configure(text="STARTING…", text_color=COLORS["amber"])
+        self.status_dot.configure(text_color=COLORS["amber"])
         self.uptime_sub_label.configure(text="CAPTURE ACTIVE", text_color=COLORS["red"])
         self.set_inputs_state("disabled")
-        notice = getattr(self, "_camera_notice", "") if use_cam else ""
-        self._camera_notice = ""
-        if notice:
-            self.show_alert(f"RECORDING STARTED  •  {what}  •  {notice}", "warning", 9000)
+        if not ok:
+            self.show_alert(f"RECORDING FOLDER CANNOT BE WRITTEN YET  •  {why}  •  "
+                            "RECORDING STARTS WHEN IT CAN", "error")
         else:
-            detail = f"  •  {self.cam_recorder.describe().upper()}" if use_cam and self.cam_recorder else ""
-            self.show_alert(f"RECORDING STARTED  •  {what}{detail}", "info", 3500)
+            self.show_alert(f"STARTING RECORDING  •  {what}…", "info")
 
-    def _start_camera_recorder(self):
-        """Plan and start the camera FFmpeg. Returns True on success."""
+    def _make_camera_recorder(self):
+        """Plan the camera FFmpeg (mode, encoder). None on a configuration error."""
         p = self._rec_params
         camera = self.get_selected_camera_path()
         if p["codec"] == "h264_vaapi" and not IS_LINUX:
             self.show_alert("VAAPI ENCODING IS ONLY AVAILABLE ON LINUX; SELECT LIBX264", "error", 6000)
-            return False
+            return None
         try:
             width, height = map(int, p["res"].split("x"))
             fps = float(p["fps"])
         except ValueError:
             self.show_alert("INVALID RESOLUTION OR FRAMERATE", "error", 5000)
-            return False
+            return None
         req = RecordingRequest(
             device=self._camera_ref(camera), width=width, height=height, fps=fps,
             codec=p["codec"], preset=p["preset"], crf=p["crf"], chunk_sec=p["chunk_sec"],
@@ -2169,47 +2198,86 @@ class AdvancedRecorderApp:
         self.root.update_idletasks()
         rec.plan()
         rec.before_start = self._before_camera_restart
-        if not rec.start():
-            self.show_alert(f"FFMPEG START FAILURE  •  {rec.last_error}", "error")
-            return False
-        self.cam_recorder = rec
         self._camera_notice = rec.take_notice()
-        return True
+        return rec
 
     def _before_camera_restart(self):
-        if not have_v4l2_ctl():
-            # re-apply the same (locked / manual) values before FFmpeg re-opens
-            self._apply_controls_before_ffmpeg(self.get_selected_camera_path(), fresh=False)
-
-    def _poll_camera_recorder(self):
+        """Runs on the supervisor thread right before FFmpeg (re)opens the
+        camera: no Tk calls here."""
+        if have_v4l2_ctl():
+            return            # Linux: applied with v4l2-ctl once FFmpeg runs
+        if self.supervisor is None or self.supervisor.pairs_started == 0:
+            return            # first start: applied by start_recording already
         rec = self.cam_recorder
-        if rec is None or not self.is_recording:
+        dev = rec.device_path if rec is not None else self.get_selected_camera_path()
+        if self._ctrl_mode == "auto" and not self._ctrl_touched:
             return
-        event = rec.poll()
-        if event == "exited":
-            self._camera_restarts += 1
-            wait = max(0, int(round((rec.next_retry_at or time.time()) - time.time())))
-            why = rec.last_error.split(" | ")[-1][:110] if rec.last_error else ""
-            self.status_text.configure(text="RECOVERING", text_color=COLORS["amber"])
-            self.status_dot.configure(text_color=COLORS["amber"])
-            self.show_alert(f"CAMERA RECORDING STOPPED  •  RESTARTING IN {wait} s  •  THERMAL CONTINUES"
-                            + (f"\n{why}" if why else ""), "warning")
-        elif event == "restarted":
-            self.status_text.configure(text="RECORDING ACTIVE", text_color=COLORS["red"])
-            self.status_dot.configure(text_color=COLORS["red"])
-            self.notify(f"CAMERA RECORDING RESUMED  •  {rec.describe().upper()}", 4000)
-            if have_v4l2_ctl():
-                self.root.after(4000, lambda: self._apply_camera_controls_async(
-                    self.get_selected_camera_path(), fresh=False))
-        notice = rec.take_notice()
-        if notice:
-            self.show_alert(notice, "warning", 9000)
+        try:
+            # re-apply the same (locked / manual) values before FFmpeg re-opens
+            self._camera_ready_hook(dev)
+        except Exception as exc:
+            log.warning("camera controls on %s: %s", dev, exc)
 
-    def _start_thermal_recorder(self, p):
-        self.thermal.acquire("record", self.get_selected_thermal_path(), avoid=self._thermal_avoid())
+    @staticmethod
+    def _short_reason(text, n=170):
+        """First and last part of a supervisor reason, for the alert banner."""
+        parts = [x.strip() for x in str(text).split(" | ") if x.strip()]
+        if not parts:
+            return ""
+        out = parts[0] if len(parts) == 1 else f"{parts[0]}  •  {parts[-1]}"
+        return out if len(out) <= n else out[:n - 1] + "…"
+
+    def _poll_supervisor(self):
+        """Once a second: show what the RecordingSupervisor did."""
+        sup = self.supervisor
+        if sup is None or not self.is_recording:
+            return
+        while True:
+            try:
+                kind, msg, dev = sup.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "started":
+                notice, self._camera_notice = getattr(self, "_camera_notice", ""), ""
+                if notice:
+                    self.show_alert(f"RECORDING STARTED  •  {msg}  •  {notice}", "warning", 9000, quiet=True)
+                else:
+                    self.show_alert(f"RECORDING STARTED  •  {msg}", "info", 4000)
+            elif kind == "resumed":
+                self.show_alert(f"RECORDING RESUMED  •  NEW FILES FOR BOTH  •  {msg}", "info", 8000)
+            elif kind == "interrupted":
+                self._camera_restarts += 1
+                level = "error" if "CANNOT BE WRITTEN" in msg else "warning"
+                self.show_alert(f"RECORDING INTERRUPTED  •  {sup.what} STOPPED TOGETHER, FILES CLOSED  •  "
+                                f"RESTARTING BOTH\n{self._short_reason(msg)}", level, quiet=True)
+            elif kind == "waiting":
+                level = "error" if "CANNOT BE WRITTEN" in msg else "warning"
+                self.show_alert(f"RECORDING PAUSED  •  NOTHING IS BEING RECORDED  •  {sup.what} RESTART "
+                                f"TOGETHER BY THEMSELVES\n{self._short_reason(msg)}", level, quiet=True)
+            elif kind == "notice":
+                self.show_alert(msg, "warning", 9000, quiet=True)
+            if kind in ("started", "resumed") and dev and have_v4l2_ctl():
+                # Once the stream runs, lock / set exposure etc. if requested.
+                fresh = kind == "started"
+                self.root.after(4000, lambda d=dev, f=fresh: self._apply_camera_controls_async(d, fresh=f))
+        state = sup.state
+        if state != getattr(self, "_last_sup_state", None):
+            self._last_sup_state = state
+            if state == sup.RECORDING:
+                self.status_text.configure(text="RECORDING ACTIVE", text_color=COLORS["red"])
+                self.status_dot.configure(text_color=COLORS["red"])
+            elif state == sup.STARTING:
+                self.status_text.configure(text="STARTING…", text_color=COLORS["amber"])
+                self.status_dot.configure(text_color=COLORS["amber"])
+            else:
+                self.status_text.configure(text="RECORDING PAUSED  •  RECOVERING", text_color=COLORS["amber"])
+                self.status_dot.configure(text_color=COLORS["amber"])
+
+    def _make_thermal_recorder(self, p):
+        """A new ThermalVideoRecorder for each file pair (called by the supervisor)."""
         preset = p["preset"] if p["preset"] in ("ultrafast", "superfast", "veryfast", "faster",
                                                 "fast", "medium") else "veryfast"
-        self.thermal_recorder = ThermalVideoRecorder(
+        return ThermalVideoRecorder(
             self.thermal,
             self.pipeline,
             out_dir=p["out_dir"],
@@ -2221,23 +2289,8 @@ class AdvancedRecorderApp:
             preset=preset,
             overlay=self.thermal_overlay_var.get(),
             log_dir=self._log_dir,
+            supervised=True,
         )
-        try:
-            self.thermal_recorder.start()
-        except Exception as exc:
-            self.thermal_recorder = None
-            self.thermal.release("record")
-            log.error("thermal recorder failed to start: %s", exc)
-            self.show_alert(f"THERMAL RECORDER FAILED  •  {exc}", "warning", 6000)
-
-    def _stop_thermal_recorder(self):
-        if self.thermal_recorder is not None:
-            try:
-                self.thermal_recorder.stop()
-            except Exception as exc:
-                log.warning("thermal recorder stop: %s", exc)
-            self.thermal_recorder = None
-        self.thermal.release("record")
 
     def stop_recording(self, reason="stopped by user"):
         if self.is_streaming:
@@ -2252,11 +2305,11 @@ class AdvancedRecorderApp:
                 pass
             self._camera_retry_id = None
 
-        if self.cam_recorder is not None:
-            self.cam_recorder.stop(timeout=15)
-            self.cam_recorder = None
-
-        self._stop_thermal_recorder()
+        if self.supervisor is not None:
+            self.supervisor.stop(timeout=15)        # finalises camera + thermal files
+            self.supervisor = None
+        self.cam_recorder = None
+        self.thermal.release("record")
 
         if self.is_recording:
             elapsed = time.time() - (self.start_time or time.time())
@@ -2329,41 +2382,67 @@ class AdvancedRecorderApp:
                 pass
 
     def update_timer_loop(self):
+        # Every step is guarded and the next tick is always scheduled: before,
+        # one exception here (a back-off overflow after ~1000 camera restarts)
+        # ended this loop for good -- no more polling, status or heartbeat.
+        try:
+            for step in (self._timer_step_clock, self._poll_supervisor, self._timer_step_recording,
+                         self._timer_step_timelapse, self._update_thermal_status,
+                         self._log_thermal_settings_changes, self._timer_step_heartbeat):
+                try:
+                    step()
+                except Exception:
+                    now = time.time()
+                    if now - getattr(self, "_timer_error_logged", 0.0) > 60:
+                        self._timer_error_logged = now
+                        log.exception("timer step %s", getattr(step, "__name__", step))
+        finally:
+            self.root.after(1000, self.update_timer_loop)
+
+    def _timer_step_clock(self):
         self.clock_label.configure(text=time.strftime("%H:%M:%S"))
 
-        if self.is_recording:
-            self._poll_camera_recorder()
-
-        if self.is_recording and self.start_time:
-            elapsed = time.time() - self.start_time
-            days = elapsed / 86400
-            hrs = int(elapsed // 3600)
-            mins = int((elapsed % 3600) // 60)
-            secs = int(elapsed % 60)
-            self.uptime_label.configure(text=f"{hrs:02d}:{mins:02d}:{secs:02d}")
-            self.uptime_sub_label.configure(text=f"{days:.2f} DAYS  •  ACTIVE", text_color=COLORS["red"])
-            rec = self.thermal_recorder
-            if rec is not None:
-                text = f"THERMAL  •  {rec.frames_written} FRAMES @ {rec.fps:g} FPS"
-                color = COLORS["orange"]
-                if self.thermal.status != "ONLINE":
-                    text = f"THERMAL  •  {self.thermal.status}  (blank frames written)"
-                    color = COLORS["amber"]
-                elif rec.last_error:
-                    text += f"  •  {rec.last_error[:40]}"
-                    color = COLORS["amber"]
-                self.thermal_rec_label.configure(text=text, text_color=color)
-            else:
-                self.thermal_rec_label.configure(text="")
-
+    def _timer_step_timelapse(self):
         if self.is_timelapse:
             self._update_countdown()
 
-        self._update_thermal_status()
-        self._log_thermal_settings_changes()
+    def _timer_step_heartbeat(self):
         if self.is_recording or self.is_timelapse:
             self._log_heartbeat()
-        self.root.after(1000, self.update_timer_loop)
+
+    def _timer_step_recording(self):
+        if not (self.is_recording and self.start_time):
+            return
+        elapsed = time.time() - self.start_time
+        days = elapsed / 86400
+        hrs = int(elapsed // 3600)
+        mins = int((elapsed % 3600) // 60)
+        secs = int(elapsed % 60)
+        self.uptime_label.configure(text=f"{hrs:02d}:{mins:02d}:{secs:02d}")
+        sup = self.supervisor
+        sub = f"{days:.2f} DAYS  •  ACTIVE"
+        if sup is not None and sup.interruptions:
+            # stays visible: an interruption at night is still seen in the morning
+            n = sup.interruptions
+            sub += f"  •  {n} INTERRUPTION{'S' if n != 1 else ''} (SEE LOG)"
+        self.uptime_sub_label.configure(text=sub, text_color=COLORS["red"])
+        if sup is None or sup.make_thermal is None:
+            self.thermal_rec_label.configure(text="")
+            return
+        rec = sup.thermal_rec
+        fps = rec.fps if rec is not None else self._thermal_fps()
+        text = f"THERMAL  •  {sup.thermal_frames} FRAMES @ {fps:g} FPS"
+        color = COLORS["orange"]
+        if sup.state != sup.RECORDING:
+            text = f"THERMAL  •  PAUSED (IN SYNC WITH THE CAMERA)  •  {sup.thermal_frames} FRAMES SO FAR"
+            color = COLORS["amber"]
+        elif self.thermal.status != "ONLINE":
+            text = f"THERMAL  •  {self.thermal.status}  (blank frames written)"
+            color = COLORS["amber"]
+        elif rec is not None and rec.last_error:
+            text += f"  •  {rec.last_error[:40]}"
+            color = COLORS["amber"]
+        self.thermal_rec_label.configure(text=text, text_color=color)
 
     def _adopt_detected_thermal(self):
         """Once the thermal camera is identified (it opened, or the normal
@@ -2451,7 +2530,7 @@ class AdvancedRecorderApp:
         """Keep the run log next to the data: <save path>/logs/studio.log."""
         log_dir = os.path.join(out_dir, "logs")
         try:
-            path = setup_logging(log_dir)
+            path = setup_logging(log_dir, fallback_dir=os.path.join(CONFIG_DIR, "logs"))
             self._log_dir = log_dir
             log.info("logging to %s", path)
         except Exception as exc:
@@ -2468,10 +2547,11 @@ class AdvancedRecorderApp:
         except Exception:
             free_gb = float("nan")
         if self.is_recording:
-            rec = self.thermal_recorder
-            log.info("heartbeat: recording %.2f h, camera restarts %d, thermal frames %s (%s), free %.1f GB",
-                     (now - (self.start_time or now)) / 3600, self._camera_restarts,
-                     rec.frames_written if rec else "-", self.thermal.status, free_gb)
+            sup = self.supervisor
+            log.info("heartbeat: recording %.2f h, %s, interruptions %d, thermal frames %s (%s), free %.1f GB",
+                     (now - (self.start_time or now)) / 3600, sup.state if sup else "-",
+                     sup.interruptions if sup else 0,
+                     sup.thermal_frames if sup and sup.make_thermal else "-", self.thermal.status, free_gb)
         elif self.is_timelapse:
             log.info("heartbeat: time-lapse, %d shots so far, next %s, thermal %s, free %.1f GB",
                      self.timelapse_shots,
@@ -2715,7 +2795,7 @@ class AdvancedRecorderApp:
         cfg = self.camera.config
         if self.camera.running and cfg and self._same_device(cfg[0], device):
             return ServiceControls(self.camera)
-        if self.is_recording and self.cam_recorder is not None:
+        if self.is_recording and self.supervisor is not None and self.supervisor.camera_running():
             raise RuntimeError("the recorder has the camera; settings are applied when a recording starts")
         return TemporaryControls(device, settle_s=settle_s)
 

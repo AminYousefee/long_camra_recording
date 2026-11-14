@@ -70,6 +70,9 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen], timeout: float = 10.0) -> None
     except Exception:
         try:
             proc.kill()
+            # wait for it to really be gone: a new FFmpeg opening the camera
+            # while this one still holds it would fail with "device busy"
+            proc.wait(timeout=5)
         except Exception:
             pass
 
